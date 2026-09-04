@@ -42,9 +42,9 @@ public struct RatchetPresentationBuilder: Sendable {
         config.startPosition = -2048
         config.endPosition = 2048
         config.initialPosition = 0
-        // Main is exactly 30% faster than the original 20-detent profile.
-        // Phones rounds its requested 20% increase from 22 to 26 detents.
-        config.detentsPerTurn = enabled ? 26 : 60
+        // Main is another 30% faster than its previous 26-detent profile
+        // (33.8 rounded to 34). Phones retains its 26-detent precision profile.
+        config.detentsPerTurn = enabled ? (role == .main ? 34 : 26) : 60
         config.vernier = enabled ? 0 : 1
         config.progressiveForce = false
         config.detentStrength = enabled ? (role == .main ? 3.5 : 2.5) : 0

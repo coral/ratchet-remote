@@ -66,9 +66,9 @@ modules.
 | Knob on Main | Adjust Main in `1.0 dB` steps, capped at `0.0 dB` |
 | Knob on Phones | Adjust Phones in `0.5 dB` steps, capped at `-15.0 dB` |
 
-Both knob modes use 26 detents per turn. Main has a stronger, snappier haptic
-profile; Phones is lighter and tuned as a tighter precision control. Movement
-inside the current detent does not change volume.
+Main uses 34 detents per turn with a stronger, snappier haptic profile. Phones
+uses 26 detents per turn with a lighter precision profile. Movement inside the
+current detent does not change volume.
 
 Output mute is implemented by saving the current level and writing the RME
 volume floor of `-65.0 dB`. Unmuting restores the saved level. If the app has no
@@ -158,4 +158,3 @@ hardware.
 - `RemoteCore` — device coordination, reconnect policy, input mapping, and
   Ratchet presentation
 - `RatchetRemote` — accessory-mode SwiftUI menu-bar application
-

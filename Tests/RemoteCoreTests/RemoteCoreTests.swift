@@ -5,30 +5,72 @@ import Testing
 
 @Test func oneFullTurnMapsToTenDBAtHalfDBPerDetent() {
     var mapper = KnobVolumeMapper()
-    #expect(mapper.consume(position: 0, authoritativeDBTenths: -400, maximumDBTenths: 0) == nil)
-    #expect(mapper.consume(position: 20, authoritativeDBTenths: -400, maximumDBTenths: 0) == -300)
+    #expect(mapper.consume(position: 0, reportedDelta: 0, authoritativeDBTenths: -400, maximumDBTenths: 0) == nil)
+    #expect(mapper.consume(position: 20, reportedDelta: 20, authoritativeDBTenths: -400, maximumDBTenths: 0) == -300)
 }
 
 @Test func mainVolumeMapsToOneDBPerDetent() {
     var mapper = KnobVolumeMapper(tenthsPerDetent: 10)
-    #expect(mapper.consume(position: 0, authoritativeDBTenths: -400, maximumDBTenths: 0) == nil)
-    #expect(mapper.consume(position: 1, authoritativeDBTenths: -400, maximumDBTenths: 0) == -390)
-    #expect(mapper.consume(position: -1, authoritativeDBTenths: -390, maximumDBTenths: 0) == -410)
+    #expect(mapper.consume(position: 0, reportedDelta: 0, authoritativeDBTenths: -400, maximumDBTenths: 0) == nil)
+    #expect(mapper.consume(position: 1, reportedDelta: 1, authoritativeDBTenths: -400, maximumDBTenths: 0) == -390)
+    #expect(mapper.consume(position: -1, reportedDelta: -2, authoritativeDBTenths: -390, maximumDBTenths: 0) == -410)
 }
 
 @Test func mapperPreservesTenthsAndClampsRoleMaximum() {
     var mapper = KnobVolumeMapper()
-    _ = mapper.consume(position: 0, authoritativeDBTenths: -151, maximumDBTenths: -150)
-    #expect(mapper.consume(position: 1, authoritativeDBTenths: -151, maximumDBTenths: -150) == -150)
-    #expect(mapper.consume(position: 2, authoritativeDBTenths: -150, maximumDBTenths: -150) == nil)
+    _ = mapper.consume(position: 0, reportedDelta: 0, authoritativeDBTenths: -151, maximumDBTenths: -150)
+    #expect(mapper.consume(position: 1, reportedDelta: 1, authoritativeDBTenths: -151, maximumDBTenths: -150) == -150)
+    #expect(mapper.consume(position: 2, reportedDelta: 1, authoritativeDBTenths: -150, maximumDBTenths: -150) == nil)
 }
 
 @Test func mapperIgnoresMotionInsideTheCurrentDetent() {
     var mapper = KnobVolumeMapper()
-    _ = mapper.consume(position: 10, authoritativeDBTenths: -200, maximumDBTenths: 0)
-    #expect(mapper.consume(position: 10, authoritativeDBTenths: -200, maximumDBTenths: 0) == nil)
-    #expect(mapper.consume(position: 11, authoritativeDBTenths: -200, maximumDBTenths: 0) == -195)
-    #expect(mapper.consume(position: 9, authoritativeDBTenths: -195, maximumDBTenths: 0) == -205)
+    _ = mapper.consume(position: 10, reportedDelta: 0, authoritativeDBTenths: -200, maximumDBTenths: 0)
+    #expect(mapper.consume(position: 10, reportedDelta: 0, authoritativeDBTenths: -200, maximumDBTenths: 0) == nil)
+    #expect(mapper.consume(position: 11, reportedDelta: 1, authoritativeDBTenths: -200, maximumDBTenths: 0) == -195)
+    #expect(mapper.consume(position: 9, reportedDelta: -2, authoritativeDBTenths: -195, maximumDBTenths: 0) == -205)
+}
+
+@Test func zeroDeltaHapticReanchorCannotChangeMainVolume() {
+    var mapper = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(mapper.consume(
+        position: -12,
+        reportedDelta: 0,
+        authoritativeDBTenths: -120,
+        maximumDBTenths: 0
+    ) == nil)
+
+    // A new haptic profile can re-anchor logical position to zero. The
+    // firmware explicitly identifies this sample as a zero-delta baseline;
+    // treating -12 -> 0 as movement would incorrectly write Main to 0.0 dB.
+    #expect(mapper.consume(
+        position: 0,
+        reportedDelta: 0,
+        authoritativeDBTenths: -120,
+        maximumDBTenths: 0
+    ) == nil)
+    #expect(mapper.consume(
+        position: 1,
+        reportedDelta: 1,
+        authoritativeDBTenths: -120,
+        maximumDBTenths: 0
+    ) == -110)
+}
+
+@Test func overlappingHapticChangesBlockUntilEveryAck() {
+    var gate = HapticTransitionGate()
+    gate.begin()
+    gate.begin()
+    #expect(gate.blocksKnobInput)
+    #expect(gate.pendingChanges == 2)
+
+    gate.complete()
+    #expect(gate.blocksKnobInput)
+    #expect(gate.pendingChanges == 1)
+
+    gate.complete()
+    #expect(!gate.blocksKnobInput)
+    #expect(gate.pendingChanges == 0)
 }
 
 @Test func activityBrightnessHoldsThenFadesLinearlyToIdle() {
@@ -167,7 +209,7 @@ import Testing
 @Test func hapticProfilesMatchActiveAndSafeDisabledSettings() {
     let main = RatchetPresentationBuilder.haptics(enabled: true, role: .main)
     #expect(main.mode == .regular)
-    #expect(main.detentsPerTurn == 26)
+    #expect(main.detentsPerTurn == 34)
     #expect(main.vernier == 0)
     #expect(main.detentStrength == 3.5)
     #expect(main.outputRamp == 250)

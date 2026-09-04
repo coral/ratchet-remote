@@ -21,9 +21,18 @@ public struct KnobVolumeMapper: Sendable {
 
     public mutating func consume(
         position: Int32,
+        reportedDelta: Int32,
         authoritativeDBTenths: Int16,
         maximumDBTenths: Int16
     ) -> Int16? {
+        // SetHaptics rearms telemetry with an authoritative zero-delta
+        // baseline. Its logical position may differ from the prior profile,
+        // so it must rebase the mapper without ever changing audio gain.
+        if reportedDelta == 0 {
+            lastPosition = position
+            accumulatedTenths = Int(authoritativeDBTenths)
+            return nil
+        }
         guard let previousPosition = lastPosition else {
             lastPosition = position
             accumulatedTenths = Int(authoritativeDBTenths)
