@@ -1,0 +1,34 @@
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Swift Package Manager build and local workspace state
+.build/
+.swiftpm/
+Packages/
+
+# Xcode build and per-user state
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+
+# Packaged build products and debug symbols
+*.app/
+*.ipa
+*.dSYM/
+*.dSYM.zip
+
+# Local tools, environment, and transient output
+.sourcekit-lsp/
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+*~

@@ -1,0 +1,9 @@
+{
+  "invocations": [
+    {
+      "protoFiles": ["ratchet.proto"],
+      "visibility": "Public",
+      "fileNaming": "DropPath"
+    }
+  ]
+}

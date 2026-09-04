@@ -1,0 +1,338 @@
+syntax = "proto3";
+
+package ratchet.v1;
+
+// Canonical source: ratchet-rs/crates/ratchet-protocol/proto/ratchet.proto.
+message HostToDevice {
+  uint32 protocol_version = 1;
+  uint32 sequence = 2;
+  oneof command {
+    Configure configure = 10;
+    SetHaptics set_haptics = 11;
+    LedFrame led_frame = 12;
+    DisplayFrame display_frame = 13;
+    Ping ping = 14;
+    RecalibrateMotor recalibrate_motor = 15;
+    DisableOutputs disable_outputs = 16;
+    RequestStatus request_status = 17;
+    RequestUsbPdStatus request_usb_pd_status = 18;
+    ProvisionUsbPd provision_usb_pd = 19;
+    EnterBootloader enter_bootloader = 20;
+  }
+}
+
+message EnterBootloader { bool confirm = 1; }
+
+message DeviceToHost {
+  uint32 protocol_version = 1;
+  uint32 sequence = 2;
+  oneof event {
+    Hello hello = 10;
+    Ready ready = 11;
+    InputEvent input = 12;
+    Ack ack = 13;
+    Fault fault = 14;
+    Pong pong = 15;
+    DeviceStatus status = 16;
+    UsbPdStatus usb_pd_status = 17;
+    UsbPdProvisionResult usb_pd_provision_result = 18;
+  }
+}
+
+message Configure {
+  HapticConfig haptics = 1;
+  LedFrame leds = 2;
+  DisplayFrame display = 3;
+  uint32 knob_report_interval_ms = 4;
+  uint32 host_watchdog_timeout_ms = 5;
+}
+
+enum HapticMode {
+  HAPTIC_MODE_DISABLED = 0;
+  HAPTIC_MODE_REGULAR = 1;
+  HAPTIC_MODE_VERNIER = 2;
+  HAPTIC_MODE_VISCOUS = 3;
+  HAPTIC_MODE_SPRING = 4;
+}
+
+message HapticConfig {
+  HapticMode mode = 1;
+  sint32 start_position = 2;
+  sint32 end_position = 3;
+  sint32 initial_position = 4;
+  uint32 detents_per_turn = 5;
+  uint32 vernier = 6;
+  bool progressive_force = 7;
+  float detent_strength = 8;
+  float endstop_strength = 9;
+  float damping = 10;
+  float output_ramp = 11;
+  float maximum_torque = 12;
+  float maximum_velocity = 13;
+  float spring_center_radians = 14;
+}
+
+message SetHaptics {
+  HapticConfig haptics = 1;
+  bool preserve_position = 2;
+}
+
+message Rgb { uint32 rgb888 = 1; }
+
+message LedFrame {
+  uint32 frame_id = 1;
+  bytes rgb888 = 2;
+  uint32 brightness = 3;
+  bool present = 4;
+}
+
+message DisplayFrame {
+  uint32 frame_id = 1;
+  repeated DrawOp operations = 2;
+  bool present = 3;
+}
+
+message DrawOp {
+  oneof operation {
+    Clear clear = 1;
+    FillRect fill_rect = 2;
+    StrokeRect stroke_rect = 3;
+    Line line = 4;
+    Circle circle = 5;
+    Arc arc = 6;
+    Text text = 7;
+    SetBacklight set_backlight = 8;
+  }
+}
+
+message Clear { Rgb color = 1; }
+
+message FillRect {
+  sint32 x = 1;
+  sint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  Rgb color = 5;
+}
+
+message StrokeRect {
+  sint32 x = 1;
+  sint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 stroke_width = 5;
+  Rgb color = 6;
+}
+
+message Line {
+  sint32 x0 = 1;
+  sint32 y0 = 2;
+  sint32 x1 = 3;
+  sint32 y1 = 4;
+  uint32 stroke_width = 5;
+  Rgb color = 6;
+}
+
+message Circle {
+  sint32 center_x = 1;
+  sint32 center_y = 2;
+  uint32 radius = 3;
+  uint32 stroke_width = 4;
+  Rgb color = 5;
+  bool filled = 6;
+}
+
+message Arc {
+  sint32 center_x = 1;
+  sint32 center_y = 2;
+  uint32 radius = 3;
+  sint32 start_degrees = 4;
+  sint32 end_degrees = 5;
+  uint32 stroke_width = 6;
+  Rgb color = 7;
+}
+
+enum FontSize {
+  FONT_SIZE_SMALL = 0;
+  FONT_SIZE_MEDIUM = 1;
+  FONT_SIZE_LARGE = 2;
+}
+
+enum TextAlign {
+  TEXT_ALIGN_LEFT = 0;
+  TEXT_ALIGN_CENTER = 1;
+  TEXT_ALIGN_RIGHT = 2;
+}
+
+message Text {
+  sint32 x = 1;
+  sint32 y = 2;
+  uint32 max_width = 3;
+  string value = 4;
+  FontSize size = 5;
+  TextAlign align = 6;
+  Rgb foreground = 7;
+  Rgb background = 8;
+  bool opaque_background = 9;
+  uint32 scale = 10;
+}
+
+message SetBacklight { uint32 brightness = 1; }
+message Ping { uint64 host_micros = 1; }
+message RecalibrateMotor {}
+message DisableOutputs { string reason = 1; }
+message RequestStatus {}
+message RequestUsbPdStatus { bool include_persistent_profile = 1; }
+message ProvisionUsbPd { bool authorize_nvm_write = 1; }
+
+message Hello {
+  string firmware_version = 1;
+  string serial_number = 2;
+  uint64 boot_id = 3;
+  Capabilities capabilities = 4;
+  bool configured = 5;
+  uint32 last_host_sequence = 6;
+  string reset_reason = 7;
+}
+
+message Capabilities {
+  uint32 ring_led_count = 1;
+  uint32 key_led_count = 2;
+  uint32 button_count = 3;
+  uint32 display_width = 4;
+  uint32 display_height = 5;
+  uint32 max_message_bytes = 6;
+  repeated HapticMode haptic_modes = 7;
+}
+
+message Ready { uint32 configuration_sequence = 1; }
+
+message InputEvent {
+  uint64 device_micros = 1;
+  oneof input {
+    ButtonEvent button = 10;
+    KnobEvent knob = 11;
+  }
+}
+
+enum ButtonEdge {
+  BUTTON_EDGE_PRESSED = 0;
+  BUTTON_EDGE_RELEASED = 1;
+}
+
+message ButtonEvent {
+  uint32 index = 1;
+  ButtonEdge edge = 2;
+  uint32 pressed_mask = 3;
+}
+
+message KnobEvent {
+  sint32 position = 1;
+  sint32 delta = 2;
+  float angle_radians = 3;
+  float velocity_radians_per_second = 4;
+  bool at_negative_limit = 5;
+  bool at_positive_limit = 6;
+}
+
+enum AckCode {
+  ACK_CODE_OK = 0;
+  ACK_CODE_INVALID_COMMAND = 1;
+  ACK_CODE_INVALID_CONFIGURATION = 2;
+  ACK_CODE_BUSY = 3;
+  ACK_CODE_NOT_CONFIGURED = 4;
+  ACK_CODE_INTERNAL_ERROR = 5;
+}
+
+message Ack {
+  uint32 command_sequence = 1;
+  AckCode code = 2;
+  string detail = 3;
+}
+
+enum FaultCode {
+  FAULT_CODE_PROTOCOL = 0;
+  FAULT_CODE_HOST_TIMEOUT = 1;
+  FAULT_CODE_MOTOR = 2;
+  FAULT_CODE_ENCODER = 3;
+  FAULT_CODE_OVERCURRENT = 4;
+  FAULT_CODE_DISPLAY = 5;
+  FAULT_CODE_LEDS = 6;
+}
+
+message Fault {
+  FaultCode code = 1;
+  string detail = 2;
+  bool outputs_disabled = 3;
+}
+
+message Pong {
+  uint64 host_micros = 1;
+  uint64 device_micros = 2;
+}
+
+message DeviceStatus {
+  bool configured = 1;
+  bool motor_enabled = 2;
+  sint32 knob_position = 3;
+  float motor_angle_radians = 4;
+  float motor_velocity_radians_per_second = 5;
+  uint32 pressed_mask = 6;
+  uint32 last_host_sequence = 7;
+  uint64 uptime_micros = 8;
+  bool motor_calibrating = 9;
+  bool motor_calibrated = 10;
+  bool motor_calibration_persisted = 11;
+}
+
+enum UsbPdProfileMatch {
+  USB_PD_PROFILE_MATCH_UNKNOWN = 0;
+  USB_PD_PROFILE_MATCH_MATCHES = 1;
+  USB_PD_PROFILE_MATCH_NEEDS_PROVISION = 2;
+}
+
+message UsbPdPowerDataObject {
+  uint32 voltage_mv = 1;
+  uint32 current_ma = 2;
+  bool usb_communications_capable = 3;
+}
+
+message UsbPdStatus {
+  uint32 request_sequence = 1;
+  bool controller_present = 2;
+  uint32 device_id = 3;
+  bool attached = 4;
+  bool vbus_ready = 5;
+  bool explicit_contract = 6;
+  uint32 policy_engine_state = 7;
+  uint32 active_sink_pdo_index = 8;
+  uint32 negotiated_voltage_mv = 9;
+  uint32 operating_current_ma = 10;
+  uint32 maximum_operating_current_ma = 11;
+  bool capability_mismatch = 12;
+  uint32 active_sink_pdo_count = 13;
+  repeated UsbPdPowerDataObject sink_pdos = 14;
+  UsbPdProfileMatch active_profile_match = 15;
+  UsbPdProfileMatch persistent_profile_match = 16;
+  uint32 persistent_change_sector_mask = 17;
+  bool reset_required = 18;
+  string detail = 19;
+}
+
+enum UsbPdProvisionOutcome {
+  USB_PD_PROVISION_OUTCOME_UNSPECIFIED = 0;
+  USB_PD_PROVISION_OUTCOME_ALREADY_CONFIGURED = 1;
+  USB_PD_PROVISION_OUTCOME_WRITTEN_AND_VERIFIED = 2;
+  USB_PD_PROVISION_OUTCOME_REJECTED = 3;
+  USB_PD_PROVISION_OUTCOME_FAILED = 4;
+}
+
+message UsbPdProvisionResult {
+  uint32 command_sequence = 1;
+  UsbPdProvisionOutcome outcome = 2;
+  uint32 changed_sector_mask = 3;
+  bool verified = 4;
+  bool reset_required = 5;
+  UsbPdStatus status = 6;
+  string detail = 7;
+}
