@@ -5,7 +5,6 @@ set -euo pipefail
 readonly SCRIPT_DIR=${0:A:h}
 readonly APP_NAME="Ratchet Remote.app"
 readonly EXECUTABLE_NAME="RatchetRemote"
-readonly RESOURCE_BUNDLE_NAME="ratchet-remote_RatchetRemote.bundle"
 readonly INSTALL_ROOT=${RATCHET_INSTALL_DIR:-/Applications}
 readonly DESTINATION="${INSTALL_ROOT}/${APP_NAME}"
 
@@ -54,7 +53,6 @@ print "Building Ratchet Remote (release)..."
 swift build --package-path "${SCRIPT_DIR}" -c release
 readonly BIN_DIR=$(swift build --package-path "${SCRIPT_DIR}" -c release --show-bin-path)
 readonly SOURCE_EXECUTABLE="${BIN_DIR}/${EXECUTABLE_NAME}"
-readonly SOURCE_RESOURCE_BUNDLE="${BIN_DIR}/${RESOURCE_BUNDLE_NAME}"
 
 if [[ ! -x ${SOURCE_EXECUTABLE} ]]; then
     print -u2 "error: release executable was not produced at ${SOURCE_EXECUTABLE}"
@@ -73,13 +71,13 @@ trap cleanup EXIT
 /usr/bin/ditto "${SOURCE_EXECUTABLE}" "${STAGED_APP}/Contents/MacOS/${EXECUTABLE_NAME}"
 /usr/bin/ditto "${SCRIPT_DIR}/Packaging/Info.plist" "${STAGED_APP}/Contents/Info.plist"
 
-# Embed SwiftPM resources in the standard signed macOS bundle location. The
-# current app does not load them dynamically, but retaining them makes the
-# installed bundle complete and keeps the artwork available for packaging.
-if [[ -d ${SOURCE_RESOURCE_BUNDLE} ]]; then
-    /usr/bin/ditto "${SOURCE_RESOURCE_BUNDLE}" \
-        "${STAGED_APP}/Contents/Resources/${RESOURCE_BUNDLE_NAME}"
-fi
+# Embed every SwiftPM resource bundle in the standard signed macOS bundle
+# location. This includes UI artwork and any resources added by library targets.
+for source_resource_bundle in "${BIN_DIR}"/ratchet-remote_*.bundle(N); do
+    resource_bundle_name=${source_resource_bundle:t}
+    /usr/bin/ditto "${source_resource_bundle}" \
+        "${STAGED_APP}/Contents/Resources/${resource_bundle_name}"
+done
 
 readonly ICON_SOURCE="${SCRIPT_DIR}/Sources/RatchetRemote/Resources/BMark.svg"
 icon_renderer=$(command -v rsvg-convert || true)

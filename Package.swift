@@ -25,6 +25,9 @@ let package = Package(
             dependencies: [
                 .product(name: "SwiftProtobuf", package: "swift-protobuf"),
             ],
+            resources: [
+                .copy("swift-protobuf-config.json"),
+            ],
             plugins: [
                 .plugin(name: "SwiftProtobufPlugin", package: "swift-protobuf"),
             ]
