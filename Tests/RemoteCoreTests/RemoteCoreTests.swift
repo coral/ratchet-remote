@@ -103,6 +103,13 @@ import Testing
     #expect(backlight.brightness == 41)
 }
 
+@Test func configurationLeavesFirmwareKnobOptionalsUnset() {
+    var builder = RatchetPresentationBuilder()
+    let configuration = builder.configuration(viewState: RemoteViewState())
+    #expect(!configuration.hasKnobIdleTimeoutMs)
+    #expect(!configuration.hasEncoderWakeThresholdCounts)
+}
+
 @Test func presentationShowsMuteOnlyKeysAndBottomMicIndicator() throws {
     var view = RemoteViewState(selectedRole: .main)
     view.rmeConnected = true

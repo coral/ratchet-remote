@@ -46,7 +46,10 @@ let package = Package(
         .executableTarget(
             name: "RatchetRemote",
             dependencies: ["RemoteCore", "RMEControl"],
-            resources: [.process("Resources")]
+            resources: [.process("Resources")],
+            linkerSettings: [
+                .linkedFramework("ServiceManagement"),
+            ]
         ),
         .testTarget(
             name: "RatchetProtocolTests",

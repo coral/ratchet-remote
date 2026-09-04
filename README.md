@@ -18,6 +18,7 @@ are available from the **B** in the menu bar.
 - Partial display updates to avoid flicker during normal volume changes
 - Automatic USB reconnect and Ratchet protocol transaction retries
 - Activity-based display and LED dimming
+- Optional launch at login using macOS Service Management
 - Native SwiftUI menu-bar interface plus CLI diagnostics
 
 ## Requirements
@@ -51,9 +52,41 @@ swift build -c release
 ```
 
 Use **Quit** in the menu-bar window to shut down cleanly and disable the
-Ratchet outputs. The current executable is CLI-runnable and structured so it
-can later be wrapped in a signed `.app` bundle without changing the core
-modules.
+Ratchet outputs.
+
+## Install as a macOS app
+
+The installer builds an optimized application bundle, gives its executable and
+resources standard macOS permissions, applies a local ad-hoc signature, and
+copies it to `/Applications/Ratchet Remote.app`:
+
+```sh
+./install.sh
+```
+
+If `/Applications` is not writable by your account, the script asks for an
+administrator password through `sudo`. To install and open it in one command:
+
+```sh
+./install.sh --launch
+```
+
+Quit any already-running CLI or app instance before launching the installed
+copy. You can then start it from Applications, Spotlight, or the command line:
+
+```sh
+open "/Applications/Ratchet Remote.app"
+```
+
+Once running from `/Applications`, open the menu-bar window and enable
+**Launch at Login**. macOS may require approval under **System Settings →
+General → Login Items**; the app shows an **Open Settings** button when that is
+needed. The option is intentionally unavailable when running through
+`swift run`, because macOS can only register the signed application bundle.
+
+This is an ad-hoc signature intended for a locally built app. Distribution to
+other Macs without Gatekeeper warnings will eventually require an Apple
+Developer ID signature and notarization.
 
 ## Hardware controls
 
@@ -158,3 +191,5 @@ hardware.
 - `RemoteCore` — device coordination, reconnect policy, input mapping, and
   Ratchet presentation
 - `RatchetRemote` — accessory-mode SwiftUI menu-bar application
+- `Packaging` and `install.sh` — macOS app metadata, bundling, signing, and
+  local installation

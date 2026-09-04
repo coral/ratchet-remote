@@ -2,10 +2,12 @@ syntax = "proto3";
 
 package ratchet.v1;
 
-// Canonical source: ratchet-rs/crates/ratchet-protocol/proto/ratchet.proto.
+// The host owns presentation and mappings. The device owns real-time motor
+// control and input sampling only.
 message HostToDevice {
   uint32 protocol_version = 1;
   uint32 sequence = 2;
+
   oneof command {
     Configure configure = 10;
     SetHaptics set_haptics = 11;
@@ -21,11 +23,15 @@ message HostToDevice {
   }
 }
 
+// Explicitly leave the application and enter the ESP32-S3 ROM download mode.
+// The confirmation bit prevents a zero-initialized message from rebooting the
+// device if a host accidentally selects this command tag.
 message EnterBootloader { bool confirm = 1; }
 
 message DeviceToHost {
   uint32 protocol_version = 1;
   uint32 sequence = 2;
+
   oneof event {
     Hello hello = 10;
     Ready ready = 11;
@@ -45,6 +51,12 @@ message Configure {
   DisplayFrame display = 3;
   uint32 knob_report_interval_ms = 4;
   uint32 host_watchdog_timeout_ms = 5;
+  // Stop fine-angle telemetry after this much time without mode-specific knob
+  // activity. Absent defaults to 30000 ms; an explicit zero disables idling.
+  optional uint32 knob_idle_timeout_ms = 6;
+  // Encoder-only mode rearms telemetry after this much signed net movement.
+  // Absent defaults to 8 raw encoder counts.
+  optional uint32 encoder_wake_threshold_counts = 7;
 }
 
 enum HapticMode {
@@ -81,6 +93,7 @@ message Rgb { uint32 rgb888 = 1; }
 
 message LedFrame {
   uint32 frame_id = 1;
+  // Exactly the advertised total LED count times 3 bytes, in RGB order.
   bytes rgb888 = 2;
   uint32 brightness = 3;
   bool present = 4;
@@ -174,6 +187,8 @@ message Text {
   Rgb foreground = 7;
   Rgb background = 8;
   bool opaque_background = 9;
+  // Integer raster scale applied by the device. Zero retains protocol-v1
+  // compatibility and means 1x; supported nonzero values are 1..=8.
   uint32 scale = 10;
 }
 
@@ -182,8 +197,20 @@ message Ping { uint64 host_micros = 1; }
 message RecalibrateMotor {}
 message DisableOutputs { string reason = 1; }
 message RequestStatus {}
-message RequestUsbPdStatus { bool include_persistent_profile = 1; }
-message ProvisionUsbPd { bool authorize_nvm_write = 1; }
+
+// Reads the STUSB4500 runtime state. Persistent-profile inspection temporarily
+// enters the controller's NVM read mode but never erases or writes NVM.
+message RequestUsbPdStatus {
+  bool include_persistent_profile = 1;
+}
+
+// Explicitly requests the audited two-PDO STUSB4500 NVM profile. The firmware
+// must reject this command unless authorize_nvm_write is true. This remains a
+// state-changing transaction and therefore participates in normal replay and
+// acknowledgement handling.
+message ProvisionUsbPd {
+  bool authorize_nvm_write = 1;
+}
 
 message Hello {
   string firmware_version = 1;
@@ -191,7 +218,10 @@ message Hello {
   uint64 boot_id = 3;
   Capabilities capabilities = 4;
   bool configured = 5;
+  // Lets a restarted host continue serial ordering within the same boot.
   uint32 last_host_sequence = 6;
+  // ESP-IDF's reset reason for this boot, rendered by the firmware so host
+  // diagnostics do not need target-specific numeric tables.
   string reset_reason = 7;
 }
 
@@ -297,6 +327,10 @@ message UsbPdPowerDataObject {
   bool usb_communications_capable = 3;
 }
 
+// A correlated snapshot of the STUSB4500 live contract and sink profile.
+// Zero negotiated_voltage_mv means that there is no valid selected sink PDO.
+// Persistent fields remain UNKNOWN/zero when they were not requested or could
+// not be read.
 message UsbPdStatus {
   uint32 request_sequence = 1;
   bool controller_present = 2;
@@ -327,6 +361,9 @@ enum UsbPdProvisionOutcome {
   USB_PD_PROVISION_OUTCOME_FAILED = 4;
 }
 
+// Completes a ProvisionUsbPd transaction. Firmware may additionally emit the
+// ordinary Ack, but this result is sufficient for the host to advance its
+// single in-flight state-changing command queue.
 message UsbPdProvisionResult {
   uint32 command_sequence = 1;
   UsbPdProvisionOutcome outcome = 2;

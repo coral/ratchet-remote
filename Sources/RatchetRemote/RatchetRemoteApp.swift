@@ -14,16 +14,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct RatchetRemoteApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var coordinator: RemoteCoordinator
+    @State private var launchAtLogin: LaunchAtLoginController
     @State private var commandLineTestStarted = false
 
     init() {
         let diagnostic = ProcessInfo.processInfo.arguments.contains("--input-test")
         _coordinator = State(initialValue: RemoteCoordinator(diagnosticLogging: diagnostic))
+        _launchAtLogin = State(initialValue: LaunchAtLoginController())
     }
 
     var body: some Scene {
         MenuBarExtra {
-            RemoteMenuView(coordinator: coordinator)
+            RemoteMenuView(coordinator: coordinator, launchAtLogin: launchAtLogin)
         } label: {
             Text("B")
                 .font(.system(size: 15, weight: .black, design: .rounded))
@@ -72,6 +74,7 @@ struct RatchetRemoteApp: App {
 
 private struct RemoteMenuView: View {
     @Bindable var coordinator: RemoteCoordinator
+    @Bindable var launchAtLogin: LaunchAtLoginController
 
     private let amber = Color(red: 1, green: 0.54, blue: 0)
     private let purple = Color(red: 0.66, green: 0.33, blue: 0.97)
@@ -86,6 +89,7 @@ private struct RemoteMenuView: View {
             controls
             Divider()
             deviceStatus
+            launchAtLoginControl
             actions
         }
         .padding(16)
@@ -261,6 +265,38 @@ private struct RemoteMenuView: View {
             .keyboardShortcut("q")
         }
         .controlSize(.small)
+    }
+
+    private var launchAtLoginControl: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Toggle(
+                "Launch at Login",
+                isOn: Binding(
+                    get: { launchAtLogin.isRegistered },
+                    set: { launchAtLogin.setEnabled($0) }
+                )
+            )
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .disabled(!launchAtLogin.canManage)
+
+            if let message = launchAtLogin.statusMessage {
+                HStack(spacing: 6) {
+                    Text(message)
+                        .font(.caption2)
+                        .foregroundStyle(launchAtLogin.requiresApproval ? .orange : .secondary)
+                    Spacer(minLength: 0)
+                    if launchAtLogin.requiresApproval {
+                        Button("Open Settings") {
+                            launchAtLogin.openSystemSettings()
+                        }
+                        .buttonStyle(.link)
+                        .controlSize(.mini)
+                    }
+                }
+            }
+        }
+        .onAppear { launchAtLogin.refresh() }
     }
 
     private var roleColor: Color {
