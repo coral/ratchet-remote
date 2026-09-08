@@ -13,6 +13,7 @@ public struct KnobVolumeMapper: Sendable {
 
     public mutating func resetBaseline() {
         lastPosition = nil
+        accumulatedTenths = nil
     }
 
     public mutating func replaceAuthoritativeVolume(_ dbTenths: Int16) {
@@ -25,30 +26,63 @@ public struct KnobVolumeMapper: Sendable {
         authoritativeDBTenths: Int16,
         maximumDBTenths: Int16
     ) -> Int16? {
-        // SetHaptics rearms telemetry with an authoritative zero-delta
-        // baseline. Its logical position may differ from the prior profile,
-        // so it must rebase the mapper without ever changing audio gain.
-        if reportedDelta == 0 {
+        // The first event after Configure/SetHaptics establishes the new
+        // logical coordinate system. The coordinator resets this mapper when
+        // that transition completes, so this baseline must never change gain.
+        if lastPosition == nil {
             lastPosition = position
+            if accumulatedTenths == nil {
+                accumulatedTenths = Int(authoritativeDBTenths)
+            }
+            guard reportedDelta != 0 else { return nil }
+
+            // The ACK for SetHaptics and its zero-delta baseline travel in
+            // separate device messages. If the baseline arrives while input is
+            // still gated, the first usable sample may already contain several
+            // crossed detents. Its reported delta is authoritative; dropping it
+            // makes the audio stop short of the physical endpoint by an amount
+            // that depends on the speed of that first movement.
             accumulatedTenths = Int(authoritativeDBTenths)
-            return nil
+            return advance(
+                by: Int64(reportedDelta),
+                authoritativeDBTenths: authoritativeDBTenths,
+                maximumDBTenths: maximumDBTenths
+            )
         }
-        guard let previousPosition = lastPosition else {
-            lastPosition = position
-            accumulatedTenths = Int(authoritativeDBTenths)
-            return nil
-        }
+
+        // Position is the authoritative logical snapshot. Comparing absolute
+        // positions survives coalesced USB snapshots and also keeps the client
+        // compatible with older firmware that published position and delta
+        // separately. If a legacy delayed delta arrives with an unchanged
+        // position, the movement is still applied exactly once.
+        let delta = Int64(position) - Int64(lastPosition!)
         lastPosition = position
-        let delta = Int64(position) - Int64(previousPosition)
         guard delta != 0 else { return nil }
+        return advance(
+            by: delta,
+            authoritativeDBTenths: authoritativeDBTenths,
+            maximumDBTenths: maximumDBTenths
+        )
+    }
+
+    private mutating func advance(
+        by delta: Int64,
+        authoritativeDBTenths: Int16,
+        maximumDBTenths: Int16
+    ) -> Int16? {
         let current = Int64(accumulatedTenths ?? Int(authoritativeDBTenths))
         let next = min(
             max(current + delta * Int64(tenthsPerDetent), Int64(RMERegisterMap.minimumDBTenths)),
             Int64(maximumDBTenths)
         )
+        // Compare against our intended value, not the asynchronously reported
+        // RME value. During a fast reversal, `authoritativeDBTenths` can happen
+        // to equal this new target while an older, different write is still
+        // queued. Dropping the new target in that case lets the stale write win
+        // and leaves the audio short of the physical haptic endpoint.
+        guard next != current else { return nil }
         accumulatedTenths = Int(next)
-        let stepped = Int16(next)
-        return stepped == authoritativeDBTenths ? nil : stepped
+        return Int16(next)
     }
 }
 

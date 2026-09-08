@@ -35,25 +35,69 @@ public struct RatchetPresentationBuilder: Sendable {
 
     public static func haptics(
         enabled: Bool,
-        role: OutputRole = .main
+        role: OutputRole = .main,
+        currentDBTenths: Int16 = -300,
+        muted: Bool = false
     ) -> Ratchet_V1_HapticConfig {
         var config = Ratchet_V1_HapticConfig()
         config.mode = enabled ? .regular : .disabled
-        config.startPosition = -2048
-        config.endPosition = 2048
         config.initialPosition = 0
+        config.maximumVelocity = 30
+
+        guard enabled else {
+            config.startPosition = -2048
+            config.endPosition = 2048
+            config.detentsPerTurn = 60
+            config.vernier = 1
+            return config
+        }
+
+        config.vernier = 0
+        config.progressiveForce = false
+
+        if muted {
+            // A zero-width regular range cannot cross a detent. Equal center
+            // and end-stop strengths make it feel like damped friction with a
+            // continuous elastic return rather than a row of clicks.
+            config.startPosition = 0
+            config.endPosition = 0
+            config.detentsPerTurn = 60
+            config.detentStrength = 3.0
+            config.endstopStrength = 3.0
+            config.damping = 0.06
+            config.outputRamp = 200
+            config.maximumTorque = 0.43
+            return config
+        }
+
+        let minimum = Int(RMERegisterMap.minimumDBTenths)
+        let maximum = Int(role.maximumDBTenths)
+        let current = min(max(Int(currentDBTenths), minimum), maximum)
+        let step = role == .main ? 10 : 5
+
+        // Anchor the current soundcard level at logical zero. The available
+        // detents in either direction exactly match the remaining audio range,
+        // so firmware end stops become the physical min/max volume limits.
+        config.startPosition = -Int32(Self.roundingUp(current - minimum, by: step))
+        config.endPosition = Int32(Self.roundingUp(maximum - current, by: step))
+
         // Main is another 30% faster than its previous 26-detent profile
         // (33.8 rounded to 34). Phones retains its 26-detent precision profile.
-        config.detentsPerTurn = enabled ? (role == .main ? 34 : 26) : 60
-        config.vernier = enabled ? 0 : 1
-        config.progressiveForce = false
-        config.detentStrength = enabled ? (role == .main ? 3.5 : 2.5) : 0
-        config.endstopStrength = enabled ? 1.0 : 0
-        config.damping = enabled ? 0.012 : 0
-        config.outputRamp = enabled ? (role == .main ? 250 : 200) : 0
-        config.maximumTorque = enabled ? (role == .main ? 0.4 : 0.35) : 0
-        config.maximumVelocity = 30
+        config.detentsPerTurn = role == .main ? 34 : 26
+        config.detentStrength = role == .main ? 3.5 : 2.5
+        config.endstopStrength = 12.0
+        config.damping = 0.012
+        config.outputRamp = role == .main ? 250 : 200
+        // Current firmware maps this through its 5.3-ohm legacy phase model
+        // and rejects demands above its 5 V * 0.8 / sqrt(3) linear-modulation
+        // limit. 0.43 is just below that enforced ceiling.
+        config.maximumTorque = 0.43
         return config
+    }
+
+    private static func roundingUp(_ distance: Int, by step: Int) -> Int {
+        precondition(distance >= 0 && step > 0)
+        return (distance + step - 1) / step
     }
 
     public mutating func configuration(
@@ -61,9 +105,12 @@ public struct RatchetPresentationBuilder: Sendable {
         brightness: UInt32 = ActivityBrightness.active
     ) -> Ratchet_V1_Configure {
         var configure = Ratchet_V1_Configure()
+        let output = viewState.selectedOutput
         configure.haptics = Self.haptics(
-            enabled: viewState.rmeConnected,
-            role: viewState.selectedRole
+            enabled: viewState.rmeConnected && output != nil,
+            role: viewState.selectedRole,
+            currentDBTenths: output?.dbTenths ?? RMERegisterMap.minimumDBTenths,
+            muted: output?.muted ?? false
         )
         configure.leds = ledFrame(viewState: viewState, brightness: brightness)
         configure.display = displayFrame(viewState: viewState, full: true, brightness: brightness)
@@ -74,10 +121,17 @@ public struct RatchetPresentationBuilder: Sendable {
 
     public mutating func hapticsCommand(
         enabled: Bool,
-        role: OutputRole
+        role: OutputRole,
+        currentDBTenths: Int16,
+        muted: Bool
     ) -> Ratchet_V1_SetHaptics {
         var command = Ratchet_V1_SetHaptics()
-        command.haptics = Self.haptics(enabled: enabled, role: role)
+        command.haptics = Self.haptics(
+            enabled: enabled,
+            role: role,
+            currentDBTenths: currentDBTenths,
+            muted: muted
+        )
         command.preservePosition = false
         return command
     }
@@ -140,7 +194,7 @@ public struct RatchetPresentationBuilder: Sendable {
     ) -> Ratchet_V1_DisplayFrame {
         frameID &+= 1
         var operations: [Ratchet_V1_DrawOp] = []
-        if full {
+        if full || !viewState.rmeConnected {
             var clear = Ratchet_V1_Clear()
             clear.color = Self.rgb(RemotePalette.black)
             var op = Ratchet_V1_DrawOp()
@@ -175,12 +229,35 @@ public struct RatchetPresentationBuilder: Sendable {
                     color: RemotePalette.yellow
                 ))
             }
+            // The device strokes circles inward: 12 pixels is 5% of the
+            // 240-pixel panel. Draw red last so opaque text cannot erase it;
+            // erase before text when unmuting so the numeric field stays intact.
+            var ring = Ratchet_V1_Circle()
+            ring.centerX = 120
+            ring.centerY = 120
+            ring.radius = 120
+            ring.strokeWidth = 12
+            ring.color = Self.rgb(outputMuted ? RemotePalette.red : RemotePalette.black)
+            var ringOp = Ratchet_V1_DrawOp()
+            ringOp.operation = .circle(ring)
+            if outputMuted {
+                operations.append(ringOp)
+            } else {
+                operations.insert(ringOp, at: full ? 1 : 0)
+            }
         } else {
             operations.append(Self.text(
-                "RME OFFLINE",
-                y: 104,
+                "RME",
+                y: 86,
                 size: .medium,
                 scale: 2,
+                color: RemotePalette.red
+            ))
+            operations.append(Self.text(
+                "DISCONNECTED",
+                y: 128,
+                size: .medium,
+                scale: 1,
                 color: RemotePalette.red
             ))
         }

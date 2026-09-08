@@ -34,11 +34,22 @@ public enum RatchetInputActivity {
             true
         case .knob(let knob):
             // Regular-mode telemetry also arrives for sub-detent angle noise.
-            // Only a crossed detent is deliberate enough to reset idle dimming.
-            knob.delta != 0
+            // A crossed detent or pressure against a configured endpoint is
+            // deliberate enough to reset idle dimming.
+            knob.delta != 0 || knob.atNegativeLimit || knob.atPositiveLimit
         case .none:
             false
         }
+    }
+}
+
+enum HapticProfilePolicy {
+    static func requiresReanchor(
+        previous: StereoOutputState?,
+        current: StereoOutputState
+    ) -> Bool {
+        guard let previous else { return false }
+        return previous.muted != current.muted
     }
 }
 

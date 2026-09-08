@@ -41,8 +41,9 @@ import Testing
     ) == nil)
 
     // A new haptic profile can re-anchor logical position to zero. The
-    // firmware explicitly identifies this sample as a zero-delta baseline;
-    // treating -12 -> 0 as movement would incorrectly write Main to 0.0 dB.
+    // coordinator resets the mapper when that transition completes; treating
+    // -12 -> 0 as movement would incorrectly write Main to 0.0 dB.
+    mapper.resetBaseline()
     #expect(mapper.consume(
         position: 0,
         reportedDelta: 0,
@@ -55,6 +56,127 @@ import Testing
         authoritativeDBTenths: -120,
         maximumDBTenths: 0
     ) == -110)
+}
+
+@Test func firstMovementAfterMissingHapticBaselineKeepsEveryDetent() {
+    var slow = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(slow.consume(
+        position: 1,
+        reportedDelta: 1,
+        authoritativeDBTenths: -90,
+        maximumDBTenths: 0
+    ) == -80)
+
+    var fast = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(fast.consume(
+        position: 5,
+        reportedDelta: 5,
+        authoritativeDBTenths: -90,
+        maximumDBTenths: 0
+    ) == -40)
+}
+
+@Test func endpointPressureDoesNotRebasePendingVolume() {
+    var mapper = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(mapper.consume(
+        position: 0,
+        reportedDelta: 0,
+        authoritativeDBTenths: -50,
+        maximumDBTenths: 0
+    ) == nil)
+    #expect(mapper.consume(
+        position: 5,
+        reportedDelta: 5,
+        authoritativeDBTenths: -50,
+        maximumDBTenths: 0
+    ) == 0)
+
+    // The motor is held beyond its endpoint while the RME state is still
+    // catching up. This must not replace the intended 0.0 dB accumulator.
+    #expect(mapper.consume(
+        position: 5,
+        reportedDelta: 0,
+        authoritativeDBTenths: -30,
+        maximumDBTenths: 0
+    ) == nil)
+    #expect(mapper.consume(
+        position: 4,
+        reportedDelta: -1,
+        authoritativeDBTenths: -30,
+        maximumDBTenths: 0
+    ) == -10)
+    #expect(mapper.consume(
+        position: 5,
+        reportedDelta: 1,
+        authoritativeDBTenths: -10,
+        maximumDBTenths: 0
+    ) == 0)
+}
+
+@Test func absolutePositionToleratesLegacySeparatelyPublishedDelta() {
+    var mapper = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(mapper.consume(
+        position: 2,
+        reportedDelta: 0,
+        authoritativeDBTenths: -20,
+        maximumDBTenths: 0
+    ) == nil)
+
+    // Legacy-firmware hardware trace: the motor's new logical position could
+    // become visible before pending_delta was accumulated. Retain compatibility
+    // by counting the absolute movement immediately.
+    #expect(mapper.consume(
+        position: 3,
+        reportedDelta: 0,
+        authoritativeDBTenths: -20,
+        maximumDBTenths: 0
+    ) == -10)
+
+    // When that delayed delta appears with the same absolute position it must
+    // not be counted for a second time.
+    #expect(mapper.consume(
+        position: 3,
+        reportedDelta: 1,
+        authoritativeDBTenths: -10,
+        maximumDBTenths: 0
+    ) == nil)
+    #expect(mapper.consume(
+        position: 4,
+        reportedDelta: 1,
+        authoritativeDBTenths: -10,
+        maximumDBTenths: 0
+    ) == 0)
+}
+
+@Test func reversalMatchingLaggingRMEEchoStillSupersedesStaleWrite() {
+    var mapper = KnobVolumeMapper(tenthsPerDetent: 10)
+    #expect(mapper.consume(
+        position: -2,
+        reportedDelta: 0,
+        authoritativeDBTenths: -90,
+        maximumDBTenths: 0
+    ) == nil)
+
+    // Captured on hardware during a fast endpoint reversal: the mapper's
+    // intended value is -9.0 dB, an older RME echo says -7.0 dB, and returning
+    // two physical detents also targets -7.0 dB. The target must still be
+    // emitted so it can replace the stale -9.0 dB write in the coalescer.
+    #expect(mapper.consume(
+        position: 0,
+        reportedDelta: 2,
+        authoritativeDBTenths: -70,
+        maximumDBTenths: 0
+    ) == -70)
+}
+
+@Test func ordinaryVolumeEchoDoesNotReanchorHapticsMidGesture() {
+    let previous = StereoOutputState(leftDBTenths: -50, rightDBTenths: -50)
+    let moved = StereoOutputState(leftDBTenths: -30, rightDBTenths: -30)
+    let muted = StereoOutputState(leftDBTenths: -650, rightDBTenths: -650)
+
+    #expect(!HapticProfilePolicy.requiresReanchor(previous: previous, current: moved))
+    #expect(HapticProfilePolicy.requiresReanchor(previous: moved, current: muted))
+    #expect(!HapticProfilePolicy.requiresReanchor(previous: nil, current: moved))
 }
 
 @Test func overlappingHapticChangesBlockUntilEveryAck() {
@@ -214,27 +336,95 @@ import Testing
 }
 
 @Test func hapticProfilesMatchActiveAndSafeDisabledSettings() {
-    let main = RatchetPresentationBuilder.haptics(enabled: true, role: .main)
+    let main = RatchetPresentationBuilder.haptics(
+        enabled: true,
+        role: .main,
+        currentDBTenths: -120
+    )
     #expect(main.mode == .regular)
+    #expect(main.startPosition == -53)
+    #expect(main.endPosition == 12)
+    #expect(main.initialPosition == 0)
     #expect(main.detentsPerTurn == 34)
     #expect(main.vernier == 0)
     #expect(main.detentStrength == 3.5)
+    #expect(main.endstopStrength == 12.0)
     #expect(main.outputRamp == 250)
-    #expect(main.maximumTorque == 0.4)
+    #expect(main.maximumTorque == 0.43)
 
-    let phones = RatchetPresentationBuilder.haptics(enabled: true, role: .phones)
+    let phones = RatchetPresentationBuilder.haptics(
+        enabled: true,
+        role: .phones,
+        currentDBTenths: -400
+    )
     #expect(phones.mode == .regular)
+    #expect(phones.startPosition == -50)
+    #expect(phones.endPosition == 50)
     #expect(phones.detentsPerTurn == 26)
     #expect(phones.detentStrength == 2.5)
+    #expect(phones.endstopStrength == 12.0)
     #expect(phones.outputRamp == 200)
-    #expect(phones.maximumTorque == 0.35)
+    #expect(phones.maximumTorque == 0.43)
+
+    let muted = RatchetPresentationBuilder.haptics(
+        enabled: true,
+        role: .main,
+        currentDBTenths: RMERegisterMap.minimumDBTenths,
+        muted: true
+    )
+    #expect(muted.mode == .regular)
+    #expect(muted.startPosition == 0)
+    #expect(muted.endPosition == 0)
+    #expect(muted.initialPosition == 0)
+    #expect(muted.detentsPerTurn == 60)
+    #expect(muted.detentStrength == 3.0)
+    #expect(muted.endstopStrength == 3.0)
+    #expect(muted.damping == 0.06)
+    #expect(muted.maximumTorque == 0.43)
 
     let disabled = RatchetPresentationBuilder.haptics(enabled: false, role: .main)
     #expect(disabled.mode == .disabled)
+    #expect(disabled.startPosition == -2048)
+    #expect(disabled.endPosition == 2048)
     #expect(disabled.detentsPerTurn == 60)
     #expect(disabled.vernier == 1)
     #expect(disabled.detentStrength == 0)
     #expect(disabled.maximumTorque == 0)
+}
+
+@Test func hapticEndpointsRoundOutwardForOffGridVolume() {
+    let main = RatchetPresentationBuilder.haptics(
+        enabled: true,
+        role: .main,
+        currentDBTenths: -121
+    )
+    #expect(main.startPosition == -53)
+    #expect(main.endPosition == 13)
+
+    let phones = RatchetPresentationBuilder.haptics(
+        enabled: true,
+        role: .phones,
+        currentDBTenths: -151
+    )
+    #expect(phones.startPosition == -100)
+    #expect(phones.endPosition == 1)
+}
+
+@Test func startupConfigurationUsesMutedCenteringProfile() {
+    var view = RemoteViewState(selectedRole: .main)
+    view.rmeConnected = true
+    view.rmeState = UCXIIState(
+        serial: 1,
+        micLine1GainDBTenths: 580,
+        main: StereoOutputState(leftDBTenths: -650, rightDBTenths: -650),
+        phones: StereoOutputState(leftDBTenths: -400, rightDBTenths: -400)
+    )
+
+    var builder = RatchetPresentationBuilder()
+    let haptics = builder.configuration(viewState: view).haptics
+    #expect(haptics.startPosition == 0)
+    #expect(haptics.endPosition == 0)
+    #expect(haptics.detentStrength == haptics.endstopStrength)
 }
 
 @Test func partialVolumeFrameAvoidsClearAndUnchangedRoleLabel() throws {
@@ -255,7 +445,7 @@ import Testing
         brightness: 80
     )
     #expect(display.present)
-    #expect(display.operations.count == 2)
+    #expect(display.operations.count == 3)
     #expect(display.operations.contains { operation in
         if case .clear? = operation.operation { true } else { false }
     } == false)
@@ -370,6 +560,55 @@ import Testing
     #expect(primary.y == 72)
 }
 
+@Test func muteBorderIsErasedOnPartialUnmute() throws {
+    var view = RemoteViewState(selectedRole: .phones)
+    view.rmeConnected = true
+    view.rmeState = UCXIIState(
+        serial: 1,
+        micLine1GainDBTenths: 580,
+        main: .init(leftDBTenths: -200, rightDBTenths: -200),
+        phones: .init(leftDBTenths: -650, rightDBTenths: -650)
+    )
+    var builder = RatchetPresentationBuilder()
+    let muted = builder.displayFrame(viewState: view, full: false)
+    let rings = muted.operations.compactMap { operation -> Ratchet_V1_Circle? in
+        guard case .circle(let circle)? = operation.operation else { return nil }
+        return circle
+    }
+    let ring = try #require(rings.first)
+    #expect(ring.centerX == 120 && ring.centerY == 120)
+    #expect(ring.radius == 120 && ring.strokeWidth == 12)
+    #expect(!ring.filled)
+    #expect(ring.color.rgb888 == RemotePalette.red)
+
+    view.selectedRole = .main
+    let live = builder.displayFrame(viewState: view, full: false)
+    guard case .circle(let erased)? = live.operations.first?.operation else {
+        Issue.record("Unmuting must erase the border before drawing text")
+        return
+    }
+    #expect(erased.radius == ring.radius)
+    #expect(erased.strokeWidth == ring.strokeWidth)
+    #expect(erased.color.rgb888 == RemotePalette.black)
+}
+
+@Test func disconnectedPartialFrameClearsScreenAndUsesTwoLines() {
+    var builder = RatchetPresentationBuilder()
+    let display = builder.displayFrame(viewState: RemoteViewState(), full: false, includeRole: false)
+    guard case .clear(let clear)? = display.operations.first?.operation else {
+        Issue.record("Disconnected frames must clear all previous content")
+        return
+    }
+    #expect(clear.color.rgb888 == RemotePalette.black)
+    let texts = display.operations.compactMap { operation -> Ratchet_V1_Text? in
+        guard case .text(let text)? = operation.operation else { return nil }
+        return text
+    }
+    #expect(texts.map(\.value) == ["RME", "DISCONNECTED"])
+    #expect(texts.map(\.y) == [86, 128])
+    #expect(display.operations.count == 4)
+}
+
 @Test func encoderNoiseDoesNotKeepTheDeviceAwake() {
     var noise = Ratchet_V1_KnobEvent()
     noise.position = 12
@@ -386,6 +625,15 @@ import Testing
     var movementInput = Ratchet_V1_InputEvent()
     movementInput.input = .knob(movement)
     #expect(RatchetInputActivity.shouldWake(for: movementInput))
+
+    var endpoint = Ratchet_V1_KnobEvent()
+    endpoint.position = 13
+    endpoint.delta = 0
+    endpoint.angleRadians = 0.2
+    endpoint.atPositiveLimit = true
+    var endpointInput = Ratchet_V1_InputEvent()
+    endpointInput.input = .knob(endpoint)
+    #expect(RatchetInputActivity.shouldWake(for: endpointInput))
 }
 
 @Test func statusDistinguishesOpenHIDFromReadyConfiguration() {

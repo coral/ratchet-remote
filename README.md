@@ -122,7 +122,9 @@ at zero and has no saved value, the fallback restore gain is `58.0 dB`.
 - Buttons 0–2 are dark while live and red only while their channel is muted.
 - Button 3 is off for Main and purple for Phones.
 - The display shows the live numeric level in white with a yellow role label.
-  A muted selected output displays the smaller red word `MUTED`.
+  A muted selected output displays the smaller red word `MUTED` and a red
+  screen border extending 12 pixels inward (5% of the screen width).
+- When RME disconnects, the display clears and shows `RME` above `DISCONNECTED`.
 
 On interaction, the display and LEDs run at 80% brightness. After five seconds
 without a button press or crossed knob detent, they fade to 5% over ten seconds.

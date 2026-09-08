@@ -141,7 +141,7 @@ public final class RemoteCoordinator {
         mappers[role]?.resetBaseline()
         if ratchetReady {
             do {
-                try sendHaptics(enabled: viewState.rmeConnected, role: role)
+                try sendHaptics()
             } catch {
                 report(error)
             }
@@ -203,6 +203,15 @@ public final class RemoteCoordinator {
             mappers[role]?.resetBaseline()
         } catch {
             await handleRMEOperationFailure(error)
+            return
+        }
+
+        if ratchetReady, viewState.selectedRole == role {
+            do {
+                try sendHaptics()
+            } catch {
+                report(error)
+            }
         }
     }
 
@@ -303,10 +312,7 @@ public final class RemoteCoordinator {
                     viewState.ratchetError = nil
                     diagnostic("Ratchet configuration Ready: command \(completion.sequence)")
                     if configuredRMEState != viewState.rmeConnected {
-                        try sendHaptics(
-                            enabled: viewState.rmeConnected,
-                            role: viewState.selectedRole
-                        )
+                        try sendHaptics()
                     } else {
                         hapticTransitions.reset()
                         mappers[viewState.selectedRole]?.resetBaseline()
@@ -365,8 +371,13 @@ public final class RemoteCoordinator {
     }
 
     private func handleKnob(_ knob: Ratchet_V1_KnobEvent) {
+        diagnostic(
+            "Knob raw: position=\(knob.position), delta=\(knob.delta), "
+                + "negativeLimit=\(knob.atNegativeLimit), positiveLimit=\(knob.atPositiveLimit)"
+        )
         guard !hapticTransitions.blocksKnobInput,
               let output = viewState.selectedOutput,
+              !output.muted,
               !output.isAtFloor,
               !outputMuteTransitions.contains(viewState.selectedRole.rmeOutput),
               var mapper = mappers[viewState.selectedRole] else {
@@ -409,6 +420,15 @@ public final class RemoteCoordinator {
                     break
                 }
             }
+            if !Task.isCancelled,
+               self.ratchetReady,
+               self.viewState.selectedOutput?.muted == true {
+                do {
+                    try self.sendHaptics()
+                } catch {
+                    self.report(error)
+                }
+            }
             self.volumeWriterTask = nil
             self.reconcileVolumeMappers()
             if !self.volumeWrites.isEmpty { self.startVolumeWriterIfNeeded() }
@@ -445,7 +465,7 @@ public final class RemoteCoordinator {
                     applyRMEState(state)
                     nextRefresh = now + 2.0
                     if ratchetReady {
-                        try sendHaptics(enabled: true, role: viewState.selectedRole)
+                        try sendHaptics()
                     }
                 } else if now >= nextRefresh {
                     let state = try await rme.refreshState(timeout: 2.0)
@@ -489,6 +509,23 @@ public final class RemoteCoordinator {
         if !volumeWrites.isBusy(.phones) {
             mappers[.phones]?.replaceAuthoritativeVolume(state.phones.dbTenths)
         }
+        let selectedRole = viewState.selectedRole
+        let selectedOutput = selectedRole.rmeOutput
+        let hapticProfileChanged = HapticProfilePolicy.requiresReanchor(
+            previous: previousState?[selectedOutput],
+            current: state[selectedOutput]
+        )
+        if wasConnected,
+           hapticProfileChanged,
+           ratchetReady,
+           !volumeWrites.isBusy(selectedRole),
+           !outputMuteTransitions.contains(selectedOutput) {
+            do {
+                try sendHaptics()
+            } catch {
+                report(error)
+            }
+        }
         if changed {
             let selectedOutputChanged = previousState?[viewState.selectedRole.rmeOutput]
                 != state[viewState.selectedRole.rmeOutput]
@@ -514,7 +551,7 @@ public final class RemoteCoordinator {
         if let error { viewState.rmeError = error.localizedDescription }
         guard ratchetReady, wasOnline else { return }
         do {
-            try sendHaptics(enabled: false, role: viewState.selectedRole)
+            try sendHaptics()
             synchronizeRatchetPresentation(displayRefresh: .full)
         } catch {
             report(error)
@@ -601,12 +638,16 @@ public final class RemoteCoordinator {
         try transmit(reports)
     }
 
-    private func sendHaptics(enabled: Bool, role: OutputRole) throws {
+    private func sendHaptics() throws {
+        let role = viewState.selectedRole
+        let output = viewState.selectedOutput
         hapticTransitions.begin()
         do {
             try send(.setHaptics(presentation.hapticsCommand(
-                enabled: enabled,
-                role: role
+                enabled: viewState.rmeConnected && output != nil,
+                role: role,
+                currentDBTenths: output?.dbTenths ?? RMERegisterMap.minimumDBTenths,
+                muted: output?.muted ?? false
             )))
         } catch {
             hapticTransitions.cancelNewest()
