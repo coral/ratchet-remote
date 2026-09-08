@@ -30,6 +30,8 @@ public enum ActivityBrightness {
 
 public struct RatchetPresentationBuilder: Sendable {
     public private(set) var frameID: UInt32 = 0
+    private var displayedMuted = false
+    private var displayedRole: OutputRole?
 
     public init() {}
 
@@ -192,6 +194,23 @@ public struct RatchetPresentationBuilder: Sendable {
         includeRole: Bool = true,
         brightness: UInt32 = ActivityBrightness.active
     ) -> Ratchet_V1_DisplayFrame {
+        let outputMuted = viewState.rmeConnected && viewState.selectedOutputMuted
+        // A haptic acknowledgement requests another display update after the
+        // mute frame. The panel draws directly, so clearing that same field
+        // again visibly cuts through the ring already on screen.
+        if !full, outputMuted, displayedMuted,
+           !includeRole || displayedRole == viewState.selectedRole {
+            return displayBrightnessFrame(brightness: brightness)
+        }
+        let redrawVolume = full || !outputMuted || !displayedMuted
+        defer {
+            displayedMuted = outputMuted
+            if !viewState.rmeConnected {
+                displayedRole = nil
+            } else if includeRole {
+                displayedRole = viewState.selectedRole
+            }
+        }
         frameID &+= 1
         var operations: [Ratchet_V1_DrawOp] = []
         if full || !viewState.rmeConnected {
@@ -203,47 +222,60 @@ public struct RatchetPresentationBuilder: Sendable {
         }
 
         if viewState.rmeConnected {
-            let outputMuted = viewState.selectedOutputMuted
             if !full, outputMuted {
-                operations.append(Self.fillRect(
-                    x: 8,
-                    y: 62,
-                    width: 224,
-                    height: 60,
-                    color: RemotePalette.black
+                if redrawVolume {
+                    operations.append(Self.fillRect(
+                        x: 8,
+                        y: 62,
+                        width: 224,
+                        height: 60,
+                        color: RemotePalette.black
+                    ))
+                }
+                if includeRole {
+                    // Both role labels fit here, entirely inside the ring.
+                    operations.append(Self.fillRect(
+                        x: 40, y: 154, width: 160, height: 24,
+                        color: RemotePalette.black
+                    ))
+                }
+            }
+            let ringIndex = operations.count
+            if redrawVolume {
+                operations.append(Self.text(
+                    viewState.volumeText,
+                    y: outputMuted ? 72 : 62,
+                    size: .large,
+                    scale: outputMuted ? 2 : 3,
+                    color: outputMuted ? RemotePalette.red : RemotePalette.white,
+                    opaqueBackground: !outputMuted
                 ))
             }
-            operations.append(Self.text(
-                viewState.volumeText,
-                y: outputMuted ? 72 : 62,
-                size: .large,
-                scale: outputMuted ? 2 : 3,
-                color: outputMuted ? RemotePalette.red : RemotePalette.white
-            ))
             if includeRole {
                 operations.append(Self.text(
                     viewState.selectedRole.label,
                     y: 154,
                     size: .small,
                     scale: 2,
-                    color: RemotePalette.yellow
+                    color: RemotePalette.yellow,
+                    opaqueBackground: !outputMuted
                 ))
             }
             // The device strokes circles inward: 12 pixels is 5% of the
-            // 240-pixel panel. Draw red last so opaque text cannot erase it;
-            // erase before text when unmuting so the numeric field stays intact.
+            // 240-pixel panel. Clear first, then draw the ring, then text.
+            // Muted text is transparent so it cannot clear over the ring.
             var ring = Ratchet_V1_Circle()
             ring.centerX = 120
             ring.centerY = 120
-            ring.radius = 120
+            // Firmware rejects the entire frame if center + radius reaches
+            // 240; the last valid pixel coordinate is 239.
+            ring.radius = 119
             ring.strokeWidth = 12
             ring.color = Self.rgb(outputMuted ? RemotePalette.red : RemotePalette.black)
             var ringOp = Ratchet_V1_DrawOp()
             ringOp.operation = .circle(ring)
-            if outputMuted {
-                operations.append(ringOp)
-            } else {
-                operations.insert(ringOp, at: full ? 1 : 0)
+            if redrawVolume {
+                operations.insert(ringOp, at: ringIndex)
             }
         } else {
             operations.append(Self.text(
@@ -329,7 +361,8 @@ public struct RatchetPresentationBuilder: Sendable {
         y: Int32,
         size: Ratchet_V1_FontSize,
         scale: UInt32,
-        color: UInt32
+        color: UInt32,
+        opaqueBackground: Bool = true
     ) -> Ratchet_V1_DrawOp {
         var text = Ratchet_V1_Text()
         // Text.x is the field's left edge; alignment happens within maxWidth.
@@ -342,7 +375,7 @@ public struct RatchetPresentationBuilder: Sendable {
         text.align = .center
         text.foreground = rgb(color)
         text.background = rgb(RemotePalette.black)
-        text.opaqueBackground = true
+        text.opaqueBackground = opaqueBackground
         text.scale = scale
         var operation = Ratchet_V1_DrawOp()
         operation.operation = .text(text)

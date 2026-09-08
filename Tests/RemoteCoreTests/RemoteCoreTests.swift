@@ -577,9 +577,27 @@ import Testing
     }
     let ring = try #require(rings.first)
     #expect(ring.centerX == 120 && ring.centerY == 120)
-    #expect(ring.radius == 120 && ring.strokeWidth == 12)
+    #expect(ring.radius == 119 && ring.strokeWidth == 12)
     #expect(!ring.filled)
     #expect(ring.color.rgb888 == RemotePalette.red)
+
+    for full in [false, true] {
+        let frame = builder.displayFrame(viewState: view, full: full)
+        var drewRing = false
+        for operation in frame.operations {
+            switch operation.operation {
+            case .clear, .fillRect:
+                #expect(!drewRing, "All clearing must precede the mute ring")
+            case .circle:
+                drewRing = true
+            case .text(let text):
+                #expect(drewRing)
+                #expect(!text.opaqueBackground, "Text must not erase the mute ring")
+            default:
+                break
+            }
+        }
+    }
 
     view.selectedRole = .main
     let live = builder.displayFrame(viewState: view, full: false)
@@ -590,6 +608,84 @@ import Testing
     #expect(erased.radius == ring.radius)
     #expect(erased.strokeWidth == ring.strokeWidth)
     #expect(erased.color.rgb888 == RemotePalette.black)
+}
+
+@Test(arguments: [true, false]) func displayCirclesRespectFirmwareBounds(full: Bool) {
+    var builder = RatchetPresentationBuilder()
+    var view = RemoteViewState()
+    view.rmeConnected = true
+    for level: Int16 in [-650, -200] {
+        view.rmeState = UCXIIState(
+            serial: 1,
+            micLine1GainDBTenths: 580,
+            main: .init(leftDBTenths: level, rightDBTenths: level),
+            phones: .init(leftDBTenths: level, rightDBTenths: level)
+        )
+        let display = builder.displayFrame(viewState: view, full: full)
+        for operation in display.operations {
+            guard case .circle(let circle)? = operation.operation else { continue }
+            // Match firmware validate_radius and validate_stroke: circles
+            // must fit entirely inside the panel, without relying on clipping.
+            let radius = Int(circle.radius)
+            #expect(radius > 0)
+            #expect(Int(circle.centerX) - radius >= 0)
+            #expect(Int(circle.centerY) - radius >= 0)
+            #expect(Int(circle.centerX) + radius < 240)
+            #expect(Int(circle.centerY) + radius < 240)
+            #expect(circle.strokeWidth > 0 && circle.strokeWidth <= 16)
+        }
+    }
+}
+
+@Test func repeatedMuteAndRoleUpdatesNeverEraseTheExistingRing() throws {
+    var builder = RatchetPresentationBuilder()
+    var view = RemoteViewState()
+    view.rmeConnected = true
+    view.rmeState = UCXIIState(
+        serial: 1,
+        micLine1GainDBTenths: 580,
+        main: .init(leftDBTenths: -650, rightDBTenths: -650),
+        phones: .init(leftDBTenths: -650, rightDBTenths: -650)
+    )
+    _ = builder.displayFrame(viewState: view, full: true)
+    // The mute update is followed by a role refresh on the haptic ACK.
+    for includeRole in [false, true, true] {
+        let repeated = builder.displayFrame(viewState: view, full: false, includeRole: includeRole)
+        #expect(repeated.operations.count == 1)
+        guard case .setBacklight? = repeated.operations.first?.operation else {
+            Issue.record("An unchanged muted scene must not redraw any pixels")
+            return
+        }
+    }
+
+    view.selectedRole = .phones
+    let switched = builder.displayFrame(viewState: view, full: false)
+    var labels: [String] = []
+    for operation in switched.operations {
+        switch operation.operation {
+        case .fillRect(let rectangle):
+            for x in [Int(rectangle.x), Int(rectangle.x) + Int(rectangle.width) - 1] {
+                for y in [Int(rectangle.y), Int(rectangle.y) + Int(rectangle.height) - 1] {
+                    #expect((x - 120) * (x - 120) + (y - 120) * (y - 120) < 107 * 107)
+                }
+            }
+        case .text(let text):
+            labels.append(text.value)
+            #expect(!text.opaqueBackground)
+        case .setBacklight:
+            break
+        default:
+            Issue.record("A muted role change must preserve the ring and MUTED text")
+        }
+    }
+    #expect(labels == ["PHONES"])
+
+    // Full configuration/reconnection frames must still restore every pixel.
+    let full = builder.displayFrame(viewState: view, full: true)
+    guard case .clear? = full.operations.first?.operation else {
+        Issue.record("Full frames must bypass redraw suppression")
+        return
+    }
 }
 
 @Test func disconnectedPartialFrameClearsScreenAndUsesTwoLines() {
