@@ -9,6 +9,8 @@ private let writeDSPSelector: UInt32 = 18
 private let readDSPSelector: UInt32 = 19
 private let dspWriteWords = 128
 private let dspReadWords = 256
+private let dspReadRetryInterval: TimeInterval = 0.020
+private let snapshotRetryInterval: TimeInterval = 0.250
 
 private final class RMEConnection {
     let port: io_connect_t
@@ -48,7 +50,9 @@ private final class RMEConnection {
     }
 
     func triggerDSPRead() throws {
-        var mode: UInt32 = 1
+        // Mode 2 requests DSP input without starting TotalMix's level-meter
+        // transfers, which this client does not consume.
+        var mode: UInt32 = 2
         let status = withUnsafePointer(to: &mode) { pointer in
             IOConnectCallMethod(
                 port,
@@ -238,12 +242,20 @@ public actor UCXIIController {
             RMEWordCodec.encodeWrite(register: RMERegisterMap.refresh, value: RMERegisterMap.refreshValue),
         ])
 
-        let deadline = ProcessInfo.processInfo.systemUptime + timeout
-        var firstRead = true
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + timeout
+        var nextRequest = started + snapshotRetryInterval
         while ProcessInfo.processInfo.systemUptime < deadline {
-            if !firstRead { try armRead(connection) }
-            firstRead = false
-            guard let words = try waitForRead(connection, deadline: deadline) else { break }
+            try armRead(connection)
+            if ProcessInfo.processInfo.systemUptime >= nextRequest {
+                // A stalled transfer can lose the first snapshot packet while
+                // the driver recovers. Request it again within the same timeout.
+                try connection.writeDSP([
+                    RMEWordCodec.encodeWrite(register: RMERegisterMap.refresh, value: RMERegisterMap.refreshValue),
+                ])
+                nextRequest = ProcessInfo.processInfo.systemUptime + snapshotRetryInterval
+            }
+            guard let words = try waitForRead(connection, deadline: min(deadline, nextRequest)) else { continue }
             _ = accumulator.update(words: words)
             _ = refreshed.update(words: words)
             if let serial, let state = refreshed.state(serial: serial) {
@@ -297,6 +309,7 @@ public actor UCXIIController {
     }
 
     private func waitForRead(_ connection: RMEConnection, deadline: TimeInterval) throws -> [UInt32]? {
+        var nextTrigger = ProcessInfo.processInfo.systemUptime + dspReadRetryInterval
         while ProcessInfo.processInfo.systemUptime < deadline {
             let words = try connection.readDSP()
             if !words.isEmpty {
@@ -306,6 +319,12 @@ public actor UCXIIController {
                 ])
                 pollSequence = (pollSequence &+ 1) & 0x0f
                 return words
+            }
+            if ProcessInfo.processInfo.systemUptime >= nextTrigger {
+                // The driver's asynchronous USB read can time out or stall.
+                // Trigger again so it can clear the stall and arm a new read.
+                try connection.triggerDSPRead()
+                nextTrigger = ProcessInfo.processInfo.systemUptime + dspReadRetryInterval
             }
             Thread.sleep(forTimeInterval: 0.005)
         }

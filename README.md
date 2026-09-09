@@ -170,6 +170,11 @@ authoritative, including changes made in TotalMix FX. If a stereo pair is
 unlinked, the quieter channel is displayed for safety; the next write through
 Ratchet Remote sets both channels to the same value.
 
+DSP reads use the driver's DSP-only trigger mode and periodically rearm empty
+reads so timed-out or stalled USB transfers can recover. Incomplete snapshots
+are requested again within the original timeout. This allows standalone reads
+with USB DriverKit 1.0.59 without requiring TotalMix FX to remain open.
+
 The selected role and saved restore levels persist in macOS user defaults.
 Disconnects are surfaced in both the menu bar and Ratchet presentation, and
 the coordinator reconnects when the hardware becomes available again.
