@@ -128,7 +128,10 @@ public enum HIDFraming {
             }
 
             guard var current = assembly else {
-                throw FrameError.invalidMetadata
+                // Attaching after a USB reconnect can start midway through a
+                // message. Ignore its valid tail and wait for the next first
+                // fragment instead of tearing down the connection again.
+                return nil
             }
             guard current.messageID == header.messageID else {
                 assembly = nil

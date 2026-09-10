@@ -3,43 +3,91 @@ import RMEControl
 import RemoteCore
 import SwiftUI
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
-    }
+@MainActor
+@Observable
+final class AppPresentationState {
+    var menuBarInserted = true
 }
 
-@main
 @MainActor
-struct RatchetRemoteApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var coordinator: RemoteCoordinator
-    @State private var launchAtLogin: LaunchAtLoginController
-    @State private var commandLineTestStarted = false
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    let coordinator = RemoteCoordinator(
+        diagnosticLogging: ProcessInfo.processInfo.arguments.contains("--input-test")
+    )
+    let launchAtLogin = LaunchAtLoginController()
+    let presentation = AppPresentationState()
+    private var controlsWindow: NSWindow?
+    private var presentationRecovery: Task<Void, Never>?
 
-    init() {
-        let diagnostic = ProcessInfo.processInfo.arguments.contains("--input-test")
-        _coordinator = State(initialValue: RemoteCoordinator(diagnosticLogging: diagnostic))
-        _launchAtLogin = State(initialValue: LaunchAtLoginController())
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(displayEnvironmentChanged),
+            name: NSApplication.didChangeScreenParametersNotification, object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self, selector: #selector(displayEnvironmentChanged),
+            name: NSWorkspace.didWakeNotification, object: nil
+        )
+        // Hardware lifetime must not depend on a menu label being rendered.
+        startApplication()
     }
 
-    var body: some Scene {
-        MenuBarExtra {
-            RemoteMenuView(coordinator: coordinator, launchAtLogin: launchAtLogin)
-        } label: {
-            Text("B")
-                .font(.system(size: 15, weight: .black, design: .rounded))
-                .onAppear { startApplication() }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        restoreMenuBar()
+        showControls()
+        return false
+    }
+
+    @objc private func displayEnvironmentChanged() {
+        restoreMenuBar()
+    }
+
+    private func restoreMenuBar() {
+        presentationRecovery?.cancel()
+        presentationRecovery = Task { [weak self] in
+            do {
+                // Let display reconfiguration settle before replacing stale
+                // status-window replicas. Preserve the existing coordinator.
+                try await Task.sleep(for: .milliseconds(250))
+                guard let self else { return }
+                self.presentation.menuBarInserted = false
+                try await Task.sleep(for: .milliseconds(50))
+                self.presentation.menuBarInserted = true
+            } catch {
+                self?.presentation.menuBarInserted = true
+            }
         }
-        .menuBarExtraStyle(.window)
+    }
+
+    private func showControls() {
+        if controlsWindow == nil {
+            let controller = NSHostingController(rootView: RemoteMenuView(
+                coordinator: coordinator, launchAtLogin: launchAtLogin
+            ))
+            let window = NSWindow(contentViewController: controller)
+            window.title = "Ratchet Remote"
+            window.styleMask = [.titled, .closable, .miniaturizable]
+            window.isReleasedWhenClosed = false
+            window.setContentSize(controller.view.fittingSize)
+            controlsWindow = window
+        }
+        guard let controlsWindow else { return }
+        // Reopening must be reachable even if the previous monitor is gone.
+        controlsWindow.center()
+        controlsWindow.deminiaturize(nil)
+        controlsWindow.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
     }
 
     private func startApplication() {
         coordinator.start()
         let arguments = ProcessInfo.processInfo.arguments
-        guard !commandLineTestStarted else { return }
+        if arguments.contains("--reconnect-test") {
+            Task { await runReconnectTest() }
+            return
+        }
         if arguments.contains("--input-test") {
-            commandLineTestStarted = true
             print("Input test ready for 45 seconds: press buttons 0-3 and turn the knob in both roles.")
             Task {
                 try? await Task.sleep(for: .seconds(45))
@@ -49,7 +97,6 @@ struct RatchetRemoteApp: App {
             return
         }
         guard arguments.contains("--smoke-test") else { return }
-        commandLineTestStarted = true
         Task {
             try? await Task.sleep(for: .seconds(5))
             let state = coordinator.viewState
@@ -69,6 +116,53 @@ struct RatchetRemoteApp: App {
             await coordinator.shutdown()
             NSApp.terminate(nil)
         }
+    }
+
+    private func runReconnectTest() async {
+        for cycle in 1...5 {
+            await coordinator.reconnect()
+            // Exercise menu replacement with no controls window open, then
+            // reopening the same process while discovery is in progress.
+            restoreMenuBar()
+            try? await Task.sleep(for: .milliseconds(500))
+            _ = applicationShouldHandleReopen(NSApp, hasVisibleWindows: false)
+            let deadline = ProcessInfo.processInfo.systemUptime + 6
+            while !coordinator.viewState.ratchetConfigured || !coordinator.viewState.rmeConnected {
+                if ProcessInfo.processInfo.systemUptime >= deadline { break }
+                try? await Task.sleep(for: .milliseconds(50))
+            }
+            let passed = coordinator.viewState.ratchetConfigured && coordinator.viewState.rmeConnected
+                && controlsWindow?.isVisible == true
+            print("Reconnect \(cycle): Ratchet=\(coordinator.viewState.ratchetConfigured), RME=\(coordinator.viewState.rmeConnected), controls=\(controlsWindow?.isVisible == true)")
+            controlsWindow?.close()
+            if !passed {
+                print("Reconnect test failed: \(coordinator.viewState.errorMessage ?? "controls unavailable")")
+                await coordinator.shutdown()
+                exit(1)
+            }
+        }
+        print("Passed 5 HID reconnects and controls-window reopen cycles.")
+        await coordinator.shutdown()
+        NSApp.terminate(nil)
+    }
+}
+
+@main
+@MainActor
+struct RatchetRemoteApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    var body: some Scene {
+        MenuBarExtra(isInserted: Binding(
+            get: { appDelegate.presentation.menuBarInserted },
+            set: { appDelegate.presentation.menuBarInserted = $0 }
+        )) {
+            RemoteMenuView(coordinator: appDelegate.coordinator, launchAtLogin: appDelegate.launchAtLogin)
+        } label: {
+            Text("B")
+                .font(.system(size: 15, weight: .black, design: .rounded))
+        }
+        .menuBarExtraStyle(.window)
     }
 }
 

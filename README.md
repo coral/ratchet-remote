@@ -143,6 +143,11 @@ live volume, and all three mute states. It can also:
 Ratchet hardware controls and the menu-bar controls share the same coordinator
 and state model.
 
+Opening Ratchet Remote again from Applications or Spotlight brings up a normal
+controls window in the existing process, even if the menu-bar item is missing.
+The app restores its menu-bar item after display changes and wake. Hardware
+connections start with the application and do not depend on the menu rendering.
+
 ## Diagnostic modes
 
 Run a five-second connection check:
@@ -153,6 +158,16 @@ swift run RatchetRemote --smoke-test
 
 The smoke test prints the detected Ratchet and current UCX II state, changes no
 RME volume or mute state, disables Ratchet outputs, and exits.
+
+To check repeated recovery with both devices connected:
+
+```sh
+swift run RatchetRemote --reconnect-test
+```
+
+This deliberately reconnects five times and opens/closes the controls window
+on each cycle. It checks that both devices and the controls recover, then
+disables Ratchet outputs and exits. Quit other Ratchet Remote instances first.
 
 To log physical button and knob events for 45 seconds:
 
@@ -178,6 +193,13 @@ with USB DriverKit 1.0.59 without requiring TotalMix FX to remain open.
 The selected role and saved restore levels persist in macOS user defaults.
 Disconnects are surfaced in both the menu bar and Ratchet presentation, and
 the coordinator reconnects when the hardware becomes available again.
+
+Ratchet recovery creates a fresh HID manager and adopts already-present
+devices. Valid fragment tails received midway through a USB reconnect are
+discarded until the next complete message. Missing Hello or device responses
+trigger recovery after three seconds; discovery also retries when no device
+was selected. Connection transitions and recovery errors are recorded in the
+macOS unified log under `com.coral.RatchetRemote` / `Connection`.
 
 ## Tests
 

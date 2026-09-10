@@ -14,6 +14,51 @@ private func decodeHostMessages(_ reports: [Data]) throws -> [Ratchet_V1_HostToD
     return messages
 }
 
+@Test func connectionWithoutHelloTimesOutEvenIfOtherEventsArrive() throws {
+    var session = RatchetSession(now: 10)
+    var message = Ratchet_V1_DeviceToHost()
+    message.protocolVersion = 1
+    message.event = .pong(Ratchet_V1_Pong())
+    _ = try session.processDeviceMessage(message, now: 12.9)
+    #expect(try session.tick(now: 12.9, hostMicros: 0).isEmpty)
+    do {
+        _ = try session.tick(now: 13, hostMicros: 0)
+        Issue.record("A connection without Hello must trigger recovery")
+    } catch RatchetSessionError.deviceSilent(let awaitingHello) {
+        #expect(awaitingHello)
+    }
+}
+
+@Test func missingDeviceResponsesTimeOutDespiteOutgoingHeartbeats() throws {
+    var session = RatchetSession(now: 0)
+    var message = Ratchet_V1_DeviceToHost()
+    message.protocolVersion = 1
+    message.event = .hello(Ratchet_V1_Hello())
+    _ = try session.processDeviceMessage(message, now: 0)
+    for now in [0.5, 1.0, 1.5, 2.0, 2.5] {
+        #expect(try session.tick(now: now, hostMicros: 0).isEmpty == false)
+    }
+    do {
+        _ = try session.tick(now: 3, hostMicros: 0)
+        Issue.record("A silent device must trigger recovery")
+    } catch RatchetSessionError.deviceSilent(let awaitingHello) {
+        #expect(!awaitingHello)
+    }
+}
+
+@Test func deviceResponsesKeepIdleSessionAlive() throws {
+    var session = RatchetSession(now: 0)
+    var message = Ratchet_V1_DeviceToHost()
+    message.protocolVersion = 1
+    message.event = .hello(Ratchet_V1_Hello())
+    _ = try session.processDeviceMessage(message, now: 0)
+    for now in [2.0, 4.0, 6.0] {
+        message.event = .pong(Ratchet_V1_Pong())
+        _ = try session.processDeviceMessage(message, now: now)
+        #expect(try session.tick(now: now + 0.5, hostMicros: 0).isEmpty == false)
+    }
+}
+
 @Test func sessionSerializesMutationsAndStartsNextAfterAck() throws {
     var session = RatchetSession(now: 0)
     let first = try session.send(.ledFrame(Ratchet_V1_LedFrame()), now: 0)

@@ -50,7 +50,7 @@ private func ratchetInputReport(
 /// IOKit callbacks are scheduled on the main run loop. The unchecked Sendable
 /// conformance records that confinement for Swift's concurrency checker.
 public final class RatchetHIDTransport: @unchecked Sendable {
-    private let manager: IOHIDManager
+    private var manager: IOHIDManager?
     private let continuation: AsyncStream<RatchetTransportEvent>.Continuation
     public let events: AsyncStream<RatchetTransportEvent>
     private var currentDevice: IOHIDDevice?
@@ -58,7 +58,6 @@ public final class RatchetHIDTransport: @unchecked Sendable {
     private var started = false
 
     public init() {
-        manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         let pair = AsyncStream<RatchetTransportEvent>.makeStream(bufferingPolicy: .bufferingNewest(256))
         events = pair.stream
         continuation = pair.continuation
@@ -71,6 +70,10 @@ public final class RatchetHIDTransport: @unchecked Sendable {
     public func start() {
         guard !started else { return }
         started = true
+        // Reusing a closed manager can retain its known-device set without
+        // replaying matching callbacks, leaving currentDevice nil forever.
+        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.manager = manager
         let matching: [String: Any] = [
             kIOHIDVendorIDKey as String: RatchetProtocolConstants.vendorID,
             kIOHIDProductIDKey as String: RatchetProtocolConstants.productID,
@@ -81,19 +84,30 @@ public final class RatchetHIDTransport: @unchecked Sendable {
         let context = Unmanaged.passUnretained(self).toOpaque()
         IOHIDManagerRegisterDeviceMatchingCallback(manager, ratchetDeviceMatched, context)
         IOHIDManagerRegisterDeviceRemovalCallback(manager, ratchetDeviceRemoved, context)
-        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerScheduleWithRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         let result = IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         if result != kIOReturnSuccess {
             continuation.yield(.error("opening Ratchet HID manager failed: 0x\(String(UInt32(bitPattern: result), radix: 16))"))
+            return
+        }
+        // Adopt already-enumerated devices as well as future callback matches.
+        // handleMatched is idempotent when the callback subsequently arrives.
+        if let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> {
+            for device in devices {
+                handleMatched(device, result: kIOReturnSuccess)
+            }
         }
     }
 
     public func stop() {
-        guard started else { return }
+        guard started, let manager else { return }
         started = false
+        IOHIDManagerRegisterDeviceMatchingCallback(manager, nil, nil)
+        IOHIDManagerRegisterDeviceRemovalCallback(manager, nil, nil)
         closeCurrentDevice()
-        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.commonModes.rawValue)
         IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        self.manager = nil
     }
 
     public func send(_ report: Data) throws {
@@ -120,7 +134,7 @@ public final class RatchetHIDTransport: @unchecked Sendable {
     }
 
     fileprivate func handleMatched(_ device: IOHIDDevice, result: IOReturn) {
-        guard result == kIOReturnSuccess, currentDevice == nil else { return }
+        guard started, result == kIOReturnSuccess, currentDevice == nil else { return }
         let openResult = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
         guard openResult == kIOReturnSuccess else {
             continuation.yield(.error("opening Ratchet H1 failed: 0x\(String(UInt32(bitPattern: openResult), radix: 16))"))
@@ -145,6 +159,7 @@ public final class RatchetHIDTransport: @unchecked Sendable {
     }
 
     fileprivate func handleReport(_ report: Data, result: IOReturn) {
+        guard started, currentDevice != nil else { return }
         guard result == kIOReturnSuccess else {
             continuation.yield(.error("reading Ratchet HID report failed: 0x\(String(UInt32(bitPattern: result), radix: 16))"))
             return
@@ -155,6 +170,7 @@ public final class RatchetHIDTransport: @unchecked Sendable {
     private func closeCurrentDevice() {
         guard let device = currentDevice else { return }
         currentDevice = nil
+        IOHIDDeviceRegisterInputReportCallback(device, inputBuffer, HIDFraming.reportSize + 1, nil, nil)
         IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
     }
 }

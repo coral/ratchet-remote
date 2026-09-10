@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Observation
+import OSLog
 import RatchetProtocol
 import RMEControl
 
@@ -56,6 +57,7 @@ public final class RemoteCoordinator {
     @ObservationIgnored private var rmeTask: Task<Void, Never>?
     @ObservationIgnored private var ratchetReconnectTask: Task<Void, Never>?
     @ObservationIgnored private var started = false
+    @ObservationIgnored private var ratchetTransportStartedAt = 0.0
     @ObservationIgnored private var lastInteractionAt = ProcessInfo.processInfo.systemUptime
     @ObservationIgnored private var presentationBrightness = ActivityBrightness.active
 
@@ -63,6 +65,7 @@ public final class RemoteCoordinator {
     private static let fallbackRestoreDBTenths: Int16 = -300
     private static let micRestoreGainDefaultsKey = "restoreMicLine1GainDBTenths"
     private static let fallbackMicRestoreGainDBTenths: Int16 = 580
+    private static let connectionLog = Logger(subsystem: "com.coral.RatchetRemote", category: "Connection")
 
     public init(
         transport: RatchetHIDTransport? = nil,
@@ -98,7 +101,7 @@ public final class RemoteCoordinator {
         started = true
         lastInteractionAt = now
         presentationBrightness = ActivityBrightness.active
-        transport.start()
+        startRatchetTransport()
 
         transportTask = Task { [weak self, events = transport.events] in
             for await event in events {
@@ -130,7 +133,7 @@ public final class RemoteCoordinator {
         viewState.ratchetConnected = false
         viewState.ratchetConfigured = false
         viewState.ratchetSerial = nil
-        transport.start()
+        startRatchetTransport()
     }
 
     public func setSelectedRole(_ role: OutputRole) {
@@ -243,6 +246,7 @@ public final class RemoteCoordinator {
     private func handleTransportEvent(_ event: RatchetTransportEvent) {
         switch event {
         case .connected(let serial):
+            Self.connectionLog.notice("Ratchet HID connected")
             session = RatchetSession(now: now)
             ratchetReady = false
             configuredRMEState = false
@@ -253,6 +257,7 @@ public final class RemoteCoordinator {
             viewState.ratchetError = nil
             diagnostic("Ratchet HID connected: \(serial ?? "unknown serial")")
         case .disconnected:
+            Self.connectionLog.notice("Ratchet HID disconnected")
             session = nil
             ratchetReady = false
             configuredRMEState = false
@@ -438,7 +443,13 @@ public final class RemoteCoordinator {
     private func tickSession() {
         let tickTime = now
         updateBrightness(at: tickTime)
-        guard var session else { return }
+        guard var session else {
+            if !viewState.ratchetConnected, ratchetReconnectTask == nil,
+               tickTime - ratchetTransportStartedAt >= RatchetSession.deviceResponseTimeout {
+                recoverRatchet(after: "Waiting for Ratchet H1; retrying device discovery")
+            }
+            return
+        }
         do {
             let reports = try session.tick(
                 now: tickTime,
@@ -701,6 +712,11 @@ public final class RemoteCoordinator {
 
     private func handleRatchetProcessingError(_ error: Error) {
         switch error {
+        case is HIDFraming.FrameError:
+            // Reassembly resets on damaged or missing fragments. Keep reading
+            // the open device so its next Hello/frame can resynchronize us.
+            Self.connectionLog.error("Ratchet framing error: \(error.localizedDescription, privacy: .public)")
+            report(error)
         case is RatchetCompatibilityError:
             session = nil
             ratchetReady = false
@@ -736,6 +752,7 @@ public final class RemoteCoordinator {
             return
         }
         viewState.ratchetError = message
+        Self.connectionLog.error("Recovering Ratchet: \(message, privacy: .public)")
         session = nil
         ratchetReady = false
         configuredRMEState = false
@@ -756,8 +773,13 @@ public final class RemoteCoordinator {
                 return
             }
             self.ratchetReconnectTask = nil
-            self.transport.start()
+            self.startRatchetTransport()
         }
+    }
+
+    private func startRatchetTransport() {
+        ratchetTransportStartedAt = now
+        transport.start()
     }
 
     private var now: TimeInterval { ProcessInfo.processInfo.systemUptime }

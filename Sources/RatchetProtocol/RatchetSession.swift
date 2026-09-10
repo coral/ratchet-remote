@@ -55,6 +55,7 @@ public struct SessionUpdate: Sendable {
 }
 
 public enum RatchetSessionError: Error, LocalizedError, Sendable {
+    case deviceSilent(awaitingHello: Bool)
     case protocolVersion(actual: UInt32, expected: UInt32)
     case queueFull(maximum: Int)
     case retryExhausted(kind: MutationKind, sequence: UInt32, retries: UInt8, protobufBytes: Int, reportCount: Int)
@@ -62,6 +63,8 @@ public enum RatchetSessionError: Error, LocalizedError, Sendable {
 
     public var errorDescription: String? {
         switch self {
+        case .deviceSilent(let awaitingHello):
+            awaitingHello ? "Ratchet did not send Hello; reconnecting" : "Ratchet stopped responding; reconnecting"
         case .protocolVersion(let actual, let expected):
             "device protocol version \(actual) does not match host version \(expected)"
         case .queueFull(let maximum):
@@ -80,6 +83,7 @@ public struct RatchetSession: Sendable {
     public static let commandMaxRetries: UInt8 = 3
     public static let maximumQueuedMutations = 16
     public static let heartbeatInterval: TimeInterval = 0.5
+    public static let deviceResponseTimeout: TimeInterval = 3
 
     private struct InFlightMutation: Sendable {
         let kind: MutationKind
@@ -97,9 +101,13 @@ public struct RatchetSession: Sendable {
     private var mutationQueue: [Ratchet_V1_HostToDevice.OneOf_Command] = []
     private var inFlight: InFlightMutation?
     private var lastHeartbeat: TimeInterval
+    private var lastDeviceActivity: TimeInterval
+    private let connectedAt: TimeInterval
 
     public init(now: TimeInterval) {
         lastHeartbeat = now
+        lastDeviceActivity = now
+        connectedAt = now
     }
 
     public var hasSeenHello: Bool { bootID != nil }
@@ -137,6 +145,10 @@ public struct RatchetSession: Sendable {
     }
 
     public mutating func tick(now: TimeInterval, hostMicros: UInt64) throws -> [Data] {
+        let lastResponse = hasSeenHello ? lastDeviceActivity : connectedAt
+        guard now - lastResponse < Self.deviceResponseTimeout else {
+            throw RatchetSessionError.deviceSilent(awaitingHello: !hasSeenHello)
+        }
         var reports = try pollTransactions(now: now)
         if hasSeenHello, now - lastHeartbeat >= Self.heartbeatInterval {
             var ping = Ratchet_V1_Ping()
@@ -162,6 +174,7 @@ public struct RatchetSession: Sendable {
                 expected: RatchetProtocolConstants.protocolVersion
             )
         }
+        lastDeviceActivity = now
 
         var update = SessionUpdate(
             message: message,
