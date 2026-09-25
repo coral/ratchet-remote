@@ -3,16 +3,15 @@ import Foundation
 import IOKit
 
 private let rmeDriverClass = "de_rme_audio_dkusb"
-private let ucxIIProductID: UInt64 = 0x3f82
+private let deviceIdentitySelector: UInt32 = 7
 private let triggerDSPReadSelector: UInt32 = 12
 private let writeDSPSelector: UInt32 = 18
 private let readDSPSelector: UInt32 = 19
-private let dspWriteWords = 128
 private let dspReadWords = 256
 private let dspReadRetryInterval: TimeInterval = 0.020
 private let snapshotRetryInterval: TimeInterval = 0.250
 
-private final class RMEConnection {
+private final class RMEConnection: UCXIIDSPTransport, @unchecked Sendable {
     let port: io_connect_t
 
     init(port: io_connect_t) {
@@ -23,14 +22,21 @@ private final class RMEConnection {
         IOServiceClose(port)
     }
 
-    func writeDSP(_ words: [UInt32]) throws {
-        guard (1...dspWriteWords).contains(words.count) else {
-            throw RMEControlError.invalidWriteCount(words.count)
+    func identify() throws -> UCXIIDeviceIdentity {
+        var scalars = [UInt64](repeating: 0, count: 2)
+        var count: UInt32 = 2
+        let status = scalars.withUnsafeMutableBufferPointer {
+            IOConnectCallScalarMethod(port, deviceIdentitySelector, nil, 0, $0.baseAddress, &count)
         }
-        var staging = [UInt32](repeating: 0, count: dspWriteWords)
-        staging.replaceSubrange(0..<words.count, with: words)
-        var scalarCount = UInt64(words.count)
-        let status: kern_return_t = staging.withUnsafeBytes { structure in
+        try checkIO(status, operation: "identifying the opened RME device")
+        guard count == 2 else { throw RMEControlError.invalidIdentitySize(count) }
+        return UCXIIDeviceIdentity(serial: scalars[0], product: scalars[1])
+    }
+
+    func writeDSP(_ words: [UInt32]) throws {
+        let packet = try UCXIIDSPWrite(words)
+        var scalarCount = packet.wordCount
+        let status: kern_return_t = packet.staging.withUnsafeBytes { structure in
             withUnsafePointer(to: &scalarCount) { count in
                 IOConnectCallMethod(
                     port,
@@ -89,8 +95,8 @@ private final class RMEConnection {
             throw RMEControlError.invalidReadSize(outputSize)
         }
         let count = outputSize / MemoryLayout<UInt32>.size
-        if count == dspReadWords, buffer.allSatisfy({ $0 == 0 }) { return [] }
-        return Array(buffer.prefix(count))
+        let words = Array(buffer.prefix(count))
+        return words.allSatisfy { $0 == 0 } ? [] : words
     }
 }
 
@@ -149,19 +155,25 @@ private func selectUCXII(serial wantedSerial: UInt64?) throws -> RMEDevice {
     var matches: [RMEDevice] = []
     while case let service = IOIteratorNext(iterator), service != 0 {
         do {
+            let vendorID = try registryParentNumber(service: service, key: "idVendor")
             let productID = try registryParentNumber(service: service, key: "idProduct")
+            guard vendorID == UCXIIDeviceIdentity.vendor, productID == UCXIIDeviceIdentity.product else {
+                IOObjectRelease(service)
+                continue
+            }
             let uid = try registryString(service: service, key: "device UID")
             guard let suffix = uid.split(separator: "-").last,
                   let serial = UInt64(suffix) else {
                 throw RMEControlError.malformedDeviceUID(uid)
             }
-            if productID == ucxIIProductID, wantedSerial == nil || serial == wantedSerial {
+            if wantedSerial == nil || serial == wantedSerial {
                 matches.append(RMEDevice(service: service, serial: serial))
             } else {
                 IOObjectRelease(service)
             }
         } catch {
             IOObjectRelease(service)
+            matches.forEach { $0.release() }
             throw error
         }
     }
@@ -176,18 +188,34 @@ private func selectUCXII(serial wantedSerial: UInt64?) throws -> RMEDevice {
 /// Owns the single serialized RME DriverKit user client used by the app.
 /// No two DSP reads or writes can overlap because all access is actor-isolated.
 public actor UCXIIController {
-    private var connection: RMEConnection?
+    private var connection: (any UCXIIDSPTransport)?
     private var serial: UInt64?
     private var pollSequence: UInt8 = 0
     private var readArmed = false
+    private var identityValidated = false
     private var accumulator = UCXIIStateAccumulator()
+    private var generation: UInt64 = 0
+    private var refreshBusy = false
+    private var nextArm: TimeInterval = 0
+    private var writeSequence: UInt64 = 0
+    private struct PendingControl: Equatable {
+        let value: Int16
+        let sequence: UInt64
+    }
+    private var pendingControls: [UInt16: PendingControl] = [:]
 
     public init() {}
+
+    // Inject the same DSP boundary used by DriverKit for hardware-free tests.
+    init(connection: any UCXIIDSPTransport, serial: UInt64) {
+        self.connection = connection
+        self.serial = serial
+    }
 
     public var isConnected: Bool { connection != nil }
 
     @discardableResult
-    public func connect(serial wantedSerial: UInt64? = nil) throws -> UCXIIState {
+    public func connect(serial wantedSerial: UInt64? = nil) async throws -> UCXIIState {
         disconnect()
         let device = try selectUCXII(serial: wantedSerial)
         defer { device.release() }
@@ -196,23 +224,31 @@ public actor UCXIIController {
             IOServiceOpen(device.service, mach_task_self_, 0, &port),
             operation: "opening the RME driver user client"
         )
-        connection = RMEConnection(port: port)
+        connection = TimedDSPTransport(RMEConnection(port: port))
         serial = device.serial
         pollSequence = 0
         readArmed = false
+        identityValidated = false
         accumulator = UCXIIStateAccumulator()
+        let session = generation
         do {
-            return try refreshState(timeout: 2.0, drainFirst: true)
+            return try await refreshState(timeout: 2.0, drainFirst: true)
         } catch {
-            disconnect()
+            if generation == session { disconnect() }
             throw error
         }
     }
 
     public func disconnect() {
+        generation &+= 1
+        refreshBusy = false
+        nextArm = 0
+        pendingControls.removeAll()
         connection = nil
         serial = nil
         readArmed = false
+        identityValidated = false
+        pollSequence = 0
         accumulator = UCXIIStateAccumulator()
     }
 
@@ -221,19 +257,65 @@ public actor UCXIIController {
         return accumulator.state(serial: serial)
     }
 
-    /// Polls one live DSP response, returning state only when a relevant register changed.
-    public func poll(timeout: TimeInterval = 0.075) throws -> UCXIIState? {
+    /// Reads at most one completed frame. Idle USB waits never occupy the actor.
+    public func poll() throws -> UCXIIState? {
+        guard !refreshBusy else { return nil }
         let connection = try requireConnection()
         try armRead(connection)
-        guard let words = try waitForRead(connection, deadline: ProcessInfo.processInfo.systemUptime + timeout) else {
-            return nil
-        }
-        guard accumulator.update(words: words), let serial else { return nil }
-        return accumulator.state(serial: serial)
+        let words = try connection.readDSP()
+        guard !words.isEmpty else { return nil }
+        readArmed = false
+        try acknowledge(connection)
+        guard accumulator.update(words: words) else { return nil }
+        try validateConfiguration(accumulator)
+        return presentedState()
     }
 
-    /// Requests a complete TotalMix state dump and makes the device authoritative.
-    public func refreshState(timeout: TimeInterval = 2.0, drainFirst: Bool = false) throws -> UCXIIState {
+    /// Desired control values are presented immediately but never stored as
+    /// observed device state. A later fresh snapshot reconciles them.
+    private func presentedState() -> UCXIIState? {
+        guard let serial else { return nil }
+        var presentation = accumulator
+        for (register, pending) in pendingControls {
+            presentation.values[register] = pending.value
+        }
+        return presentation.state(serial: serial)
+    }
+
+    public func refreshState(timeout: TimeInterval = 2.0, drainFirst: Bool = true) async throws -> UCXIIState {
+        let pendingAtStart = pendingControls
+        let refreshed = try await refreshRegisters(nil, timeout: timeout, drainFirst: drainFirst)
+        guard let serial, refreshed.state(serial: serial) != nil else {
+            throw RMEControlError.snapshotTimedOut(missingRegisters: refreshed.missingRegisters)
+        }
+        accumulator = refreshed
+        for (register, pending) in pendingAtStart where pendingControls[register] == pending {
+            if refreshed.values[register] != pending.value {
+                RMETiming.log.error("control.readback-mismatch register=\(register) expected=\(pending.value) actual=\(refreshed.values[register] ?? -9999)")
+            }
+            pendingControls.removeValue(forKey: register)
+        }
+        return presentedState()!
+    }
+
+    private func refreshRegisters(
+        _ required: Set<UInt16>?, timeout: TimeInterval = 2.0, drainFirst: Bool = true
+    ) async throws -> UCXIIStateAccumulator {
+        let session = generation
+        while refreshBusy {
+            try await Task.sleep(for: .milliseconds(5))
+            guard generation == session else { throw RMEControlError.notConnected }
+        }
+        refreshBusy = true
+        defer { if generation == session { refreshBusy = false } }
+        let operationStart = ProcessInfo.processInfo.systemUptime
+        var frames = 0
+        var requests = 1
+        var succeeded = false
+        defer {
+            RMETiming.record("refresh", since: operationStart,
+                detail: "required=\(required?.sorted().description ?? "state") frames=\(frames) requests=\(requests) success=\(succeeded)")
+        }
         let connection = try requireConnection()
         if drainFirst { try drain(connection) }
         var refreshed = UCXIIStateAccumulator()
@@ -245,6 +327,7 @@ public actor UCXIIController {
         let started = ProcessInfo.processInfo.systemUptime
         let deadline = started + timeout
         var nextRequest = started + snapshotRetryInterval
+        var seen: Set<UInt16> = []
         while ProcessInfo.processInfo.systemUptime < deadline {
             try armRead(connection)
             if ProcessInfo.processInfo.systemUptime >= nextRequest {
@@ -254,35 +337,75 @@ public actor UCXIIController {
                     RMEWordCodec.encodeWrite(register: RMERegisterMap.refresh, value: RMERegisterMap.refreshValue),
                 ])
                 nextRequest = ProcessInfo.processInfo.systemUptime + snapshotRetryInterval
+                requests += 1
             }
-            guard let words = try waitForRead(connection, deadline: min(deadline, nextRequest)) else { continue }
+            guard let words = try await waitForRead(connection, deadline: min(deadline, nextRequest)) else { continue }
+            frames += 1
+            // As in the Rust session, extend only when new register addresses
+            // arrive. Repeated unsolicited updates must not suppress retries.
+            let previousCount = seen.count
+            for word in words where word != 0 && !word.nonzeroBitCount.isMultiple(of: 2) {
+                seen.insert(RMEWordCodec.decode(word).register)
+            }
+            if seen.count > previousCount {
+                nextRequest = ProcessInfo.processInfo.systemUptime + snapshotRetryInterval
+            }
             _ = accumulator.update(words: words)
             _ = refreshed.update(words: words)
-            if let serial, let state = refreshed.state(serial: serial) {
-                accumulator = refreshed
-                return state
+            try validateConfiguration(refreshed)
+            let missing = required.map { $0.filter { refreshed.values[$0] == nil }.sorted() }
+                ?? refreshed.missingRegisters
+            if missing.isEmpty {
+                succeeded = true
+                return refreshed
             }
         }
-        throw RMEControlError.snapshotTimedOut(missingRegisters: refreshed.missingRegisters)
+        throw RMEControlError.snapshotTimedOut(
+            missingRegisters: required.map { $0.filter { refreshed.values[$0] == nil }.sorted() }
+                ?? refreshed.missingRegisters
+        )
     }
 
     public func setMicLine1Gain(dbTenths: Int16) throws -> UCXIIState? {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { RMETiming.record("mic.submit", since: start, detail: "target=\(dbTenths)") }
+        guard currentState() != nil else { throw RMEControlError.notConnected }
         let value = min(
             max(dbTenths, RMERegisterMap.minimumMicGainDBTenths),
             RMERegisterMap.maximumMicGainDBTenths
         )
         try write([(RMERegisterMap.micLine1Gain, value)])
-        accumulator.set(register: RMERegisterMap.micLine1Gain, value: value)
-        return currentState()
+        // Present the submitted value immediately; reconciliation is exclusively
+        // background work. No input action waits for a device snapshot.
+        rememberSubmitted([(RMERegisterMap.micLine1Gain, value)])
+        return presentedState()
     }
 
     public func setVolume(dbTenths: Int16, output: RMEOutput) throws -> UCXIIState? {
+        let start = ProcessInfo.processInfo.systemUptime
+        defer { RMETiming.record("volume.submit", since: start, detail: "output=\(output.rawValue) target=\(dbTenths)") }
         let value = min(max(dbTenths, RMERegisterMap.minimumDBTenths), output.maximumDBTenths)
-        let registers = RMERegisterMap.volumeRegisters(for: output)
+        guard let state = currentState() else { throw RMEControlError.notConnected }
+        let registers = try RMERegisterMap.volumeRegisters(for: output, mainPair: state.mainOutputPair)
         try write([(registers.0, value), (registers.1, value)])
-        accumulator.set(register: registers.0, value: value)
-        accumulator.set(register: registers.1, value: value)
-        return currentState()
+        rememberSubmitted([(registers.0, value), (registers.1, value)])
+        return presentedState()
+    }
+
+    private func rememberSubmitted(_ values: [(UInt16, Int16)]) {
+        writeSequence &+= 1
+        for (register, value) in values {
+            pendingControls[register] = PendingControl(value: value, sequence: writeSequence)
+        }
+    }
+
+    private func validateConfiguration(_ state: UCXIIStateAccumulator) throws {
+        if let mode = state.values[RMERegisterMap.classCompliantMode], mode != 0 {
+            throw RMEControlError.unsupportedDeviceMode(mode)
+        }
+        if let pair = state.values[RMERegisterMap.controlRoomMain], !(0..<10).contains(pair) {
+            throw RMEControlError.invalidMainAssignment(pair)
+        }
     }
 
     private func write(_ values: [(UInt16, Int16)]) throws {
@@ -290,34 +413,58 @@ public actor UCXIIController {
         try connection.writeDSP(values.map { RMEWordCodec.encodeWrite(register: $0.0, value: $0.1) })
     }
 
-    private func requireConnection() throws -> RMEConnection {
+    private func requireConnection() throws -> any UCXIIDSPTransport {
         guard let connection else { throw RMEControlError.notConnected }
+        if !identityValidated {
+            guard let serial else { throw RMEControlError.notConnected }
+            try connection.identify().validate(expectedSerial: serial)
+            identityValidated = true
+        }
         return connection
     }
 
-    private func drain(_ connection: RMEConnection) throws {
+    private func drain(_ connection: any UCXIIDSPTransport) throws {
+        let start = ProcessInfo.processInfo.systemUptime
+        var frames = 0
+        defer { RMETiming.record("drain", since: start, detail: "frames=\(frames)") }
         for _ in 0..<64 {
-            if try connection.readDSP().isEmpty { break }
+            if try connection.readDSP().isEmpty {
+                readArmed = false
+                return
+            }
+            try acknowledge(connection)
+            frames += 1
         }
-        readArmed = false
+        throw RMEControlError.dspQueueNotDrained
     }
 
-    private func armRead(_ connection: RMEConnection) throws {
-        guard !readArmed else { return }
+    private func armRead(_ connection: any UCXIIDSPTransport) throws {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !readArmed || now >= nextArm else { return }
         try connection.triggerDSPRead()
         readArmed = true
+        nextArm = now + dspReadRetryInterval
     }
 
-    private func waitForRead(_ connection: RMEConnection, deadline: TimeInterval) throws -> [UInt32]? {
+    private func acknowledge(_ connection: any UCXIIDSPTransport) throws {
+        try connection.writeDSP([
+            RMEWordCodec.encodeWrite(register: RMERegisterMap.poll, value: Int16(pollSequence)),
+        ])
+        pollSequence = (pollSequence &+ 1) & 0x0f
+    }
+
+    private func waitForRead(_ connection: any UCXIIDSPTransport, deadline: TimeInterval) async throws -> [UInt32]? {
+        let session = generation
+        let start = ProcessInfo.processInfo.systemUptime
+        var emptyReads = 0
+        var rearms = 0
+        defer { RMETiming.record("read.wait", since: start, detail: "empty=\(emptyReads) rearms=\(rearms)") }
         var nextTrigger = ProcessInfo.processInfo.systemUptime + dspReadRetryInterval
         while ProcessInfo.processInfo.systemUptime < deadline {
             let words = try connection.readDSP()
             if !words.isEmpty {
                 readArmed = false
-                try connection.writeDSP([
-                    RMEWordCodec.encodeWrite(register: RMERegisterMap.poll, value: Int16(pollSequence & 0x0f)),
-                ])
-                pollSequence = (pollSequence &+ 1) & 0x0f
+                try acknowledge(connection)
                 return words
             }
             if ProcessInfo.processInfo.systemUptime >= nextTrigger {
@@ -325,8 +472,11 @@ public actor UCXIIController {
                 // Trigger again so it can clear the stall and arm a new read.
                 try connection.triggerDSPRead()
                 nextTrigger = ProcessInfo.processInfo.systemUptime + dspReadRetryInterval
+                rearms += 1
             }
-            Thread.sleep(forTimeInterval: 0.005)
+            emptyReads += 1
+            try await Task.sleep(for: .milliseconds(5))
+            guard generation == session else { throw RMEControlError.notConnected }
         }
         return nil
     }

@@ -6,8 +6,8 @@ public enum RMEOutput: String, CaseIterable, Sendable {
 
     public var label: String {
         switch self {
-        case .main: "Main 1/2"
-        case .phones: "Phones 7/8"
+        case .main: "Main Out"
+        case .phones: "Phones"
         }
     }
 
@@ -44,17 +44,20 @@ public struct UCXIIState: Equatable, Sendable {
     public var micLine1GainDBTenths: Int16
     public var main: StereoOutputState
     public var phones: StereoOutputState
+    public var mainOutputPair: Int16
 
     public init(
         serial: UInt64,
         micLine1GainDBTenths: Int16,
         main: StereoOutputState,
-        phones: StereoOutputState
+        phones: StereoOutputState,
+        mainOutputPair: Int16 = 0
     ) {
         self.serial = serial
         self.micLine1GainDBTenths = micLine1GainDBTenths
         self.main = main
         self.phones = phones
+        self.mainOutputPair = mainOutputPair
     }
 
     /// The UCX II has no digital mute here; zero preamp gain is the practical
@@ -80,6 +83,12 @@ public enum RMEControlError: Error, LocalizedError, Sendable {
     case invalidWriteCount(Int)
     case invalidReadSize(Int)
     case snapshotTimedOut(missingRegisters: [UInt16])
+    case invalidMainAssignment(Int16)
+    case unsafeDSPWrite(UInt16)
+    case invalidIdentitySize(UInt32)
+    case deviceIdentityMismatch(serial: UInt64, product: UInt64)
+    case unsupportedDeviceMode(Int16)
+    case dspQueueNotDrained
     case notConnected
 
     public var errorDescription: String? {
@@ -95,6 +104,14 @@ public enum RMEControlError: Error, LocalizedError, Sendable {
         case .snapshotTimedOut(let registers):
             "timed out reading UCX II state; missing " + registers.map { String(format: "0x%04x", $0) }.joined(separator: ", ")
         case .notConnected: "the Fireface UCX II is not connected"
+        case .invalidMainAssignment(let pair): "Main Out has no supported output-pair assignment (\(pair))"
+        case .unsafeDSPWrite(let register):
+            "refusing to write outside the remote's gain/volume controls: " + String(format: "0x%04x", register)
+        case .invalidIdentitySize(let count): "RME identity reply must contain two scalars (received \(count))"
+        case .deviceIdentityMismatch(let serial, let product):
+            "opened RME device differs from the selected UCX II: serial \(serial), product \(product)"
+        case .unsupportedDeviceMode(let mode): "UCX II is not in the supported RME USB mode (\(mode))"
+        case .dspQueueNotDrained: "RME DSP queue did not drain before requesting fresh state"
         }
     }
 }

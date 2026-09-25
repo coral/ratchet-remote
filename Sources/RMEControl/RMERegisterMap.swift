@@ -7,6 +7,8 @@ public enum RMERegisterMap {
     public static let maximumMicGainDBTenths: Int16 = 750
 
     public static let micLine1Gain: UInt16 = 0x0008
+    public static let controlRoomMain: UInt16 = 0x3050
+    public static let classCompliantMode: UInt16 = 0x307a
 
     public static let mainLeftVolume: UInt16 = 0x0500
     public static let mainRightVolume: UInt16 = 0x0540
@@ -18,16 +20,27 @@ public enum RMERegisterMap {
     static let refresh: UInt16 = 0x3e04
     static let refreshValue: Int16 = 0x67cd
 
-    public static let stateRegisters: Set<UInt16> = [
-        micLine1Gain,
-        mainLeftVolume, mainRightVolume,
-        phonesLeftVolume, phonesRightVolume,
-    ]
+    // Fixed mono slots from rme-volume/baked/protocol.xml. A submix is an
+    // output destination, not a collection of input faders to move together.
+    static let outputVolumeRegisters: Set<UInt16> = Set((0..<20).map {
+        UInt16(0x0500 + $0 * 0x40)
+    })
+    public static let stateRegisters: Set<UInt16> = outputVolumeRegisters.union([
+        micLine1Gain, controlRoomMain, classCompliantMode,
+    ])
 
-    static func volumeRegisters(for output: RMEOutput) -> (UInt16, UInt16) {
+    static func volumeRegisters(for output: RMEOutput, mainPair: Int16) throws -> (UInt16, UInt16) {
         switch output {
-        case .main: (mainLeftVolume, mainRightVolume)
-        case .phones: (phonesLeftVolume, phonesRightVolume)
+        case .main:
+            guard (0..<10).contains(mainPair) else {
+                throw RMEControlError.invalidMainAssignment(mainPair)
+            }
+            let left = UInt16(0x0500 + Int(mainPair) * 2 * 0x40)
+            return (left, left + 0x40)
+        case .phones:
+            // Phones1Chan=6 in the supplied TotalMix workspace. The protocol
+            // does not define a live Phones assignment register.
+            return (phonesLeftVolume, phonesRightVolume)
         }
     }
 
@@ -57,6 +70,7 @@ struct UCXIIStateAccumulator: Sendable {
     mutating func update(words: some Sequence<UInt32>) -> Bool {
         var changed = false
         for word in words {
+            guard word != 0, !word.nonzeroBitCount.isMultiple(of: 2) else { continue }
             let decoded = RMEWordCodec.decode(word)
             guard RMERegisterMap.stateRegisters.contains(decoded.register) else { continue }
             if values[decoded.register] != decoded.value {
@@ -67,18 +81,26 @@ struct UCXIIStateAccumulator: Sendable {
         return changed
     }
 
-    mutating func set(register: UInt16, value: Int16) {
-        values[register] = value
-    }
-
     var missingRegisters: [UInt16] {
-        RMERegisterMap.stateRegisters.filter { values[$0] == nil }.sorted()
+        var required: Set<UInt16> = [
+            RMERegisterMap.micLine1Gain, RMERegisterMap.controlRoomMain,
+            RMERegisterMap.classCompliantMode,
+            RMERegisterMap.phonesLeftVolume, RMERegisterMap.phonesRightVolume,
+        ]
+        if let pair = values[RMERegisterMap.controlRoomMain],
+           let registers = try? RMERegisterMap.volumeRegisters(for: .main, mainPair: pair) {
+            required.formUnion([registers.0, registers.1])
+        }
+        return required.filter { values[$0] == nil }.sorted()
     }
 
     func state(serial: UInt64) -> UCXIIState? {
-        guard let micGain = values[RMERegisterMap.micLine1Gain],
-              let mainLeft = values[RMERegisterMap.mainLeftVolume],
-              let mainRight = values[RMERegisterMap.mainRightVolume],
+        guard values[RMERegisterMap.classCompliantMode] == 0,
+              let pair = values[RMERegisterMap.controlRoomMain],
+              let registers = try? RMERegisterMap.volumeRegisters(for: .main, mainPair: pair),
+              let micGain = values[RMERegisterMap.micLine1Gain],
+              let mainLeft = values[registers.0],
+              let mainRight = values[registers.1],
               let phonesLeft = values[RMERegisterMap.phonesLeftVolume],
               let phonesRight = values[RMERegisterMap.phonesRightVolume] else { return nil }
 
@@ -92,7 +114,8 @@ struct UCXIIStateAccumulator: Sendable {
             phones: StereoOutputState(
                 leftDBTenths: phonesLeft,
                 rightDBTenths: phonesRight
-            )
+            ),
+            mainOutputPair: pair
         )
     }
 }

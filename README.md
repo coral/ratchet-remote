@@ -11,7 +11,7 @@ are available from the **B** in the menu bar.
 
 ## Features
 
-- Live Main 1/2, Phones 7/8, and Mic/Line 1 state from the UCX II
+- Live Main Out, Phones, and Mic/Line 1 state from the UCX II
 - Haptic volume control with separate Main and Phones tuning
 - Reversible output and microphone mute behavior
 - Directional LED volume arc and persistent microphone-mute indicator
@@ -103,6 +103,14 @@ Main uses 34 detents per turn with a stronger, snappier haptic profile. Phones
 uses 26 detents per turn with a lighter precision profile. Movement inside the
 current detent does not change volume.
 
+Main Out follows the UCX II's live Control Room Main assignment (`0x3050`).
+In the supplied TotalMix setup this is Analog 1/2 (Genelec). Phones controls
+the Phones 7/8 destination (Headphones), matching `Phones1Chan=6` in the supplied
+workspace. The documented protocol has no live Phones assignment binding, so
+reassigning Phones in TotalMix requires updating that mapping here.
+These controls change the destination's stereo master volume; they do not
+change the input or playback sends that make up its submix.
+
 Output mute is implemented by saving the current level and writing the RME
 volume floor of `-65.0 dB`. Unmuting restores the saved level. If the app has no
 saved value, it falls back to `-30.0 dB`, constrained by the output's cap.
@@ -110,7 +118,20 @@ saved value, it falls back to `-30.0 dB`, constrained by the output's cap.
 Mic/Line 1 mute uses `0.0 dB` preamp gain as a practical mute for the attached
 low-output microphone. The app reads the live gain at startup, saves it before
 muting, and restores it when unmuted. If it first starts with the gain already
-at zero and has no saved value, the fallback restore gain is `58.0 dB`.
+at zero and has no saved value, the fallback restore gain is `59.0 dB`, matching
+the supplied SM7B setup.
+
+Mic mute/unmute writes only the Mic/Line 1 preamp gain register (`0x0008`) and
+updates the UI immediately, with background readback reconciliation. It preserves the
+existing mic send to ADAT 1/2, all other input/playback sends, and the ADAT
+return routing. It does not configure or repair those routes: keep the intended
+mic-only-to-ADAT routing in TotalMix. Ordinary computer recording receives Mic 1
+independently of monitor sends. Zero preamp gain is a practical attenuation for
+this microphone, not digital silence.
+
+The DriverKit write boundary rejects input-mute metadata, submix faders/pans,
+matrix coefficients, and all settings outside gain/output volume and the DSP
+read handshake. Received snapshots are never replayed as writes.
 
 ## Ratchet indicators
 
@@ -185,10 +206,44 @@ authoritative, including changes made in TotalMix FX. If a stereo pair is
 unlinked, the quieter channel is displayed for safety; the next write through
 Ratchet Remote sets both channels to the same value.
 
+Discovery matches RME vendor `2a39` and UCX II product `3f82`, then checks the
+opened connection's serial/product via DriverKit's device-identity method.
+The initial snapshot must confirm RME USB mode before gain/volume control is
+available. Reconnects retain the selected serial for the app session, clear
+observed state, and read fresh values without restoring cached mixer settings.
+Knob, mic mute, and output mute commands are sent immediately and their requested
+values are shown while pending; they are kept separate from observed device
+state. Input actions never request or wait for snapshots. After 150 ms without a control write, one
+fresh snapshot reconciles the latest levels. A snapshot already in flight
+cannot overwrite a newer requested level. No stream start/stop, sample-rate
+or buffer-size calls are made.
+
 DSP reads use the driver's DSP-only trigger mode and periodically rearm empty
-reads so timed-out or stalled USB transfers can recover. Incomplete snapshots
-are requested again within the original timeout. This allows standalone reads
+reads so timed-out or stalled USB transfers can recover. Refreshes first drain
+and acknowledge queued responses; only fresh responses complete a snapshot.
+Incomplete snapshots are retried after a quiet interval within the original
+timeout, allowing later register blocks to arrive. This allows standalone reads
 with USB DriverKit 1.0.59 without requiring TotalMix FX to remain open.
+
+Live polls consume one completed frame and return immediately. Snapshot waits
+suspend asynchronously so new writes and disconnects can proceed; individual
+DriverKit calls and the response/ACK stream remain serialized.
+An incomplete background snapshot retains the last known state and schedules
+a retry; it does not disconnect the controller. Initial connection still
+requires a complete snapshot before enabling controls.
+
+Slow RME operations and main-thread stalls are logged under
+`com.coral.RatchetRemote`, categories `RMETiming` and `ControlTiming`. To include
+fast operations and knob/button events, launch with `--diagnostics`:
+
+```sh
+open -a "Ratchet Remote" --args --diagnostics
+log stream --style compact --predicate 'subsystem == "com.coral.RatchetRemote"'
+```
+
+Quit the existing instance before launching with this flag. Logs distinguish
+driver call duration, snapshot frames/retries, response waiting, total knob
+round-trip time, main-actor tick gaps, readback mismatches, and recovery errors.
 
 The selected role and saved restore levels persist in macOS user defaults.
 Disconnects are surfaced in both the menu bar and Ratchet presentation, and
@@ -208,7 +263,9 @@ swift test
 ```
 
 The test suite covers HID fragmentation and reassembly, reliable protocol
-transactions, RME register encoding and state decoding, knob mapping, idle
+transactions, RME register encoding and state decoding, Main assignment,
+mic gain write isolation/readback, identity/mode validation, DSP payload boundaries
+and ACKs, knob mapping, idle
 dimming, and display/LED presentation. Tests do not write to attached audio
 hardware.
 

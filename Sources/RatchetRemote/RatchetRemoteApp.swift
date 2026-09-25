@@ -13,6 +13,7 @@ final class AppPresentationState {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let coordinator = RemoteCoordinator(
         diagnosticLogging: ProcessInfo.processInfo.arguments.contains("--input-test")
+            || ProcessInfo.processInfo.arguments.contains("--diagnostics")
     )
     let launchAtLogin = LaunchAtLoginController()
     let presentation = AppPresentationState()
@@ -271,12 +272,12 @@ private struct RemoteMenuView: View {
                 action: { await coordinator.toggleMicLine1Mute() }
             )
             muteRow(
-                title: "Phones 7/8",
+                title: "Phones",
                 muted: coordinator.viewState.rmeState?.phones.muted,
                 action: { await coordinator.toggleMute(.phones) }
             )
             muteRow(
-                title: "Main 1/2",
+                title: "Main Out",
                 muted: coordinator.viewState.rmeState?.main.muted,
                 action: { await coordinator.toggleMute(.main) }
             )

@@ -51,6 +51,7 @@ public final class RemoteCoordinator {
     @ObservationIgnored private var restoreVolumes: [RMEOutput: Int16] = [:]
     @ObservationIgnored private var micMuteTransition = false
     @ObservationIgnored private var restoreMicGain: Int16?
+    @ObservationIgnored private var rmeSerial: UInt64?
     @ObservationIgnored private var volumeWriterTask: Task<Void, Never>?
     @ObservationIgnored private var transportTask: Task<Void, Never>?
     @ObservationIgnored private var sessionTask: Task<Void, Never>?
@@ -64,8 +65,12 @@ public final class RemoteCoordinator {
     private static let selectedRoleDefaultsKey = "selectedOutputRole"
     private static let fallbackRestoreDBTenths: Int16 = -300
     private static let micRestoreGainDefaultsKey = "restoreMicLine1GainDBTenths"
-    private static let fallbackMicRestoreGainDBTenths: Int16 = 580
+    private static let fallbackMicRestoreGainDBTenths: Int16 = 590
     private static let connectionLog = Logger(subsystem: "com.coral.RatchetRemote", category: "Connection")
+    private static let timingLog = Logger(subsystem: "com.coral.RatchetRemote", category: "ControlTiming")
+    @ObservationIgnored private var lastSessionTick: TimeInterval?
+    @ObservationIgnored private var lastControlSubmission: TimeInterval = 0
+    @ObservationIgnored private var controlReadbackDue = false
 
     public init(
         transport: RatchetHIDTransport? = nil,
@@ -172,6 +177,8 @@ public final class RemoteCoordinator {
 
         do {
             applyRMEState(try await rme.setMicLine1Gain(dbTenths: target))
+            lastControlSubmission = now
+            controlReadbackDue = true
         } catch {
             await handleRMEOperationFailure(error)
         }
@@ -203,6 +210,8 @@ public final class RemoteCoordinator {
 
         do {
             applyRMEState(try await rme.setVolume(dbTenths: target, output: output))
+            lastControlSubmission = now
+            controlReadbackDue = true
             mappers[role]?.resetBaseline()
         } catch {
             await handleRMEOperationFailure(error)
@@ -408,10 +417,17 @@ public final class RemoteCoordinator {
             guard let self else { return }
             while !Task.isCancelled, let request = self.volumeWrites.beginNext() {
                 do {
+                    let started = self.now
                     let state = try await self.rme.setVolume(
                         dbTenths: request.value,
                         output: request.role.rmeOutput
                     )
+                    self.lastControlSubmission = self.now
+                    self.controlReadbackDue = true
+                    let elapsed = (self.now - started) * 1_000
+                    if elapsed >= 50 || self.diagnosticLogging {
+                        Self.timingLog.notice("volume.roundtrip ms=\(elapsed) role=\(request.role.rawValue, privacy: .public) target=\(request.value)")
+                    }
                     self.applyRMEState(state)
                     self.volumeWrites.finish(request.role)
                     // Limit DriverKit writes to 50 Hz and give newer HID samples
@@ -442,6 +458,10 @@ public final class RemoteCoordinator {
 
     private func tickSession() {
         let tickTime = now
+        if let lastSessionTick, tickTime - lastSessionTick > 0.200 {
+            Self.timingLog.warning("main-actor.tick-gap ms=\((tickTime - lastSessionTick) * 1_000)")
+        }
+        lastSessionTick = tickTime
         updateBrightness(at: tickTime)
         guard var session else {
             if !viewState.ratchetConnected, ratchetReconnectTask == nil,
@@ -472,20 +492,38 @@ public final class RemoteCoordinator {
         while !Task.isCancelled {
             do {
                 if !viewState.rmeConnected {
-                    let state = try await rme.connect()
+                    let state = try await rme.connect(serial: rmeSerial)
+                    rmeSerial = state.serial
                     applyRMEState(state)
                     nextRefresh = now + 2.0
                     if ratchetReady {
                         try sendHaptics()
                     }
-                } else if now >= nextRefresh {
+                } else if (controlReadbackDue || now >= nextRefresh),
+                          volumeWrites.isEmpty, now - lastControlSubmission >= 0.150 {
+                    controlReadbackDue = false
                     let state = try await rme.refreshState(timeout: 2.0)
                     applyRMEState(state)
                     nextRefresh = now + 2.0
                 } else if let state = try await rme.poll() {
                     applyRMEState(state)
                 }
+                // poll() only consumes completed frames; let USB finish without
+                // occupying the RME actor or spinning on the main actor.
+                try await Task.sleep(for: .milliseconds(5))
+            } catch is CancellationError {
+                return
             } catch {
+                if case RMEControlError.snapshotTimedOut = error, viewState.rmeConnected {
+                    // A partial periodic dump is not a USB disconnect. Keep
+                    // servicing live updates and retry without resetting HID,
+                    // haptics, mapper baselines, or the user's pending targets.
+                    Self.timingLog.warning("background.snapshot-incomplete: \(error.localizedDescription, privacy: .public); retaining state and retrying")
+                    nextRefresh = now + 0.5
+                    controlReadbackDue = false
+                    continue
+                }
+                Self.connectionLog.error("RME recovery: \(error.localizedDescription, privacy: .public)")
                 await rme.disconnect()
                 markRMEOffline(error: error)
                 try? await Task.sleep(for: .seconds(1))
@@ -676,6 +714,7 @@ public final class RemoteCoordinator {
     }
 
     private func diagnostic(_ message: String) {
+        if diagnosticLogging { Self.timingLog.notice("\(message, privacy: .public)") }
         if diagnosticLogging { print(message) }
     }
 

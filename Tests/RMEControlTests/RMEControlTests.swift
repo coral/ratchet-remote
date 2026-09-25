@@ -13,6 +13,8 @@ import Testing
 @Test func stateUsesQuieterStereoSideAndFloorAsMute() throws {
     var accumulator = UCXIIStateAccumulator()
     _ = accumulator.update(words: [
+        RMEWordCodec.encodeWrite(register: RMERegisterMap.controlRoomMain, value: 0),
+        RMEWordCodec.encodeWrite(register: RMERegisterMap.classCompliantMode, value: 0),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.micLine1Gain, value: 580),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.mainLeftVolume, value: -200),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.mainRightVolume, value: -210),
@@ -32,6 +34,8 @@ import Testing
 @Test func zeroMicGainIsPracticalMute() throws {
     var accumulator = UCXIIStateAccumulator()
     _ = accumulator.update(words: [
+        RMEWordCodec.encodeWrite(register: RMERegisterMap.controlRoomMain, value: 0),
+        RMEWordCodec.encodeWrite(register: RMERegisterMap.classCompliantMode, value: 0),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.micLine1Gain, value: 0),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.mainLeftVolume, value: -200),
         RMEWordCodec.encodeWrite(register: RMERegisterMap.mainRightVolume, value: -200),
