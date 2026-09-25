@@ -95,8 +95,8 @@ private final class RMEConnection: UCXIIDSPTransport, @unchecked Sendable {
             throw RMEControlError.invalidReadSize(outputSize)
         }
         let count = outputSize / MemoryLayout<UInt32>.size
-        let words = Array(buffer.prefix(count))
-        return words.allSatisfy { $0 == 0 } ? [] : words
+        let words = buffer.prefix(count)
+        return words.allSatisfy { $0 == 0 } ? [] : Array(words)
     }
 }
 
@@ -284,7 +284,7 @@ public actor UCXIIController {
 
     public func refreshState(timeout: TimeInterval = 2.0, drainFirst: Bool = true) async throws -> UCXIIState {
         let pendingAtStart = pendingControls
-        let refreshed = try await refreshRegisters(nil, timeout: timeout, drainFirst: drainFirst)
+        let refreshed = try await refreshRegisters(timeout: timeout, drainFirst: drainFirst)
         guard let serial, refreshed.state(serial: serial) != nil else {
             throw RMEControlError.snapshotTimedOut(missingRegisters: refreshed.missingRegisters)
         }
@@ -299,7 +299,7 @@ public actor UCXIIController {
     }
 
     private func refreshRegisters(
-        _ required: Set<UInt16>?, timeout: TimeInterval = 2.0, drainFirst: Bool = true
+        timeout: TimeInterval, drainFirst: Bool
     ) async throws -> UCXIIStateAccumulator {
         let session = generation
         while refreshBusy {
@@ -313,8 +313,8 @@ public actor UCXIIController {
         var requests = 1
         var succeeded = false
         defer {
-            RMETiming.record("refresh", since: operationStart,
-                detail: "required=\(required?.sorted().description ?? "state") frames=\(frames) requests=\(requests) success=\(succeeded)")
+            RMETiming.record("refresh", since: operationStart, slowThreshold: timeout,
+                detail: "frames=\(frames) requests=\(requests) success=\(succeeded)")
         }
         let connection = try requireConnection()
         if drainFirst { try drain(connection) }
@@ -353,17 +353,12 @@ public actor UCXIIController {
             _ = accumulator.update(words: words)
             _ = refreshed.update(words: words)
             try validateConfiguration(refreshed)
-            let missing = required.map { $0.filter { refreshed.values[$0] == nil }.sorted() }
-                ?? refreshed.missingRegisters
-            if missing.isEmpty {
+            if refreshed.missingRegisters.isEmpty {
                 succeeded = true
                 return refreshed
             }
         }
-        throw RMEControlError.snapshotTimedOut(
-            missingRegisters: required.map { $0.filter { refreshed.values[$0] == nil }.sorted() }
-                ?? refreshed.missingRegisters
-        )
+        throw RMEControlError.snapshotTimedOut(missingRegisters: refreshed.missingRegisters)
     }
 
     public func setMicLine1Gain(dbTenths: Int16) throws -> UCXIIState? {
@@ -458,7 +453,8 @@ public actor UCXIIController {
         let start = ProcessInfo.processInfo.systemUptime
         var emptyReads = 0
         var rearms = 0
-        defer { RMETiming.record("read.wait", since: start, detail: "empty=\(emptyReads) rearms=\(rearms)") }
+        defer { RMETiming.record("read.wait", since: start, slowThreshold: snapshotRetryInterval,
+                                detail: "empty=\(emptyReads) rearms=\(rearms)") }
         var nextTrigger = ProcessInfo.processInfo.systemUptime + dspReadRetryInterval
         while ProcessInfo.processInfo.systemUptime < deadline {
             let words = try connection.readDSP()

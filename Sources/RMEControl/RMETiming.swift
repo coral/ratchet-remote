@@ -5,9 +5,16 @@ enum RMETiming {
     static let log = Logger(subsystem: "com.coral.RatchetRemote", category: "RMETiming")
     static let verbose = ProcessInfo.processInfo.arguments.contains("--diagnostics")
 
-    static func record(_ operation: String, since start: TimeInterval, detail: String = "") {
+    static func record(
+        _ operation: String,
+        since start: TimeInterval,
+        slowThreshold: TimeInterval = 0.050,
+        detail: @autoclosure () -> String = ""
+    ) {
         let milliseconds = (ProcessInfo.processInfo.systemUptime - start) * 1_000
-        if milliseconds >= 50 {
+        guard milliseconds >= slowThreshold * 1_000 || verbose else { return }
+        let detail = detail()
+        if milliseconds >= slowThreshold * 1_000 {
             log.warning("\(operation, privacy: .public) ms=\(milliseconds) \(detail, privacy: .public)")
         } else if verbose {
             log.notice("\(operation, privacy: .public) ms=\(milliseconds) \(detail, privacy: .public)")

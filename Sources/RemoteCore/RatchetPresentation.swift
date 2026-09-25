@@ -32,6 +32,7 @@ public struct RatchetPresentationBuilder: Sendable {
     public private(set) var frameID: UInt32 = 0
     private var displayedMuted = false
     private var displayedRole: OutputRole?
+    private static let keyPairs = [[3, 4], [2, 5], [1, 6], [0, 7]]
 
     public init() {}
 
@@ -180,9 +181,15 @@ public struct RatchetPresentationBuilder: Sendable {
 
         var frame = Ratchet_V1_LedFrame()
         frame.frameID = frameID
-        frame.rgb888 = Data(colors.flatMap { color in
-            [UInt8(color >> 16), UInt8((color >> 8) & 0xff), UInt8(color & 0xff)]
-        })
+        var pixels = Data(count: colors.count * 3)
+        pixels.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) in
+            for (index, color) in colors.enumerated() {
+                bytes[index * 3] = UInt8(color >> 16)
+                bytes[index * 3 + 1] = UInt8((color >> 8) & 0xff)
+                bytes[index * 3 + 2] = UInt8(color & 0xff)
+            }
+        }
+        frame.rgb888 = pixels
         frame.brightness = min(brightness, 255)
         frame.present = true
         return frame
@@ -328,8 +335,7 @@ public struct RatchetPresentationBuilder: Sendable {
     }
 
     private static func setKey(_ button: Int, color: UInt32, in colors: inout [UInt32]) {
-        let pairs = [[3, 4], [2, 5], [1, 6], [0, 7]]
-        for key in pairs[button] { colors[60 + key] = color }
+        for key in keyPairs[button] { colors[60 + key] = color }
     }
 
     private static func fillRect(

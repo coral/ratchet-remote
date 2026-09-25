@@ -38,6 +38,7 @@ public final class RemoteCoordinator {
     @ObservationIgnored private let diagnosticLogging: Bool
     @ObservationIgnored private var session: RatchetSession?
     @ObservationIgnored private var presentation = RatchetPresentationBuilder()
+    @ObservationIgnored private var lastLEDFrame: Ratchet_V1_LedFrame?
     @ObservationIgnored private var ratchetReady = false
     @ObservationIgnored private var configuredRMEState = false
     @ObservationIgnored private var hapticTransitions = HapticTransitionGate()
@@ -116,7 +117,9 @@ public final class RemoteCoordinator {
         }
         sessionTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                try? await Task.sleep(for: .milliseconds(50))
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                } catch { return }
                 self.tickSession()
             }
         }
@@ -193,7 +196,9 @@ public final class RemoteCoordinator {
         let role: OutputRole = output == .main ? .main : .phones
         volumeWrites.discardPending(role)
         while volumeWrites.isBusy(role) {
-            try? await Task.sleep(for: .milliseconds(5))
+            do {
+                try await Task.sleep(for: .milliseconds(5))
+            } catch { return }
         }
 
         guard let current = viewState.rmeState?[output] else { return }
@@ -239,7 +244,9 @@ public final class RemoteCoordinator {
             try? send(.disableOutputs(disable))
             let deadline = now + 0.5
             while ratchetReady, now < deadline {
-                try? await Task.sleep(for: .milliseconds(10))
+                do {
+                    try await Task.sleep(for: .milliseconds(10))
+                } catch { break }
             }
         }
         started = false
@@ -452,7 +459,7 @@ public final class RemoteCoordinator {
             }
             self.volumeWriterTask = nil
             self.reconcileVolumeMappers()
-            if !self.volumeWrites.isEmpty { self.startVolumeWriterIfNeeded() }
+            if !Task.isCancelled, !self.volumeWrites.isEmpty { self.startVolumeWriterIfNeeded() }
         }
     }
 
@@ -533,6 +540,7 @@ public final class RemoteCoordinator {
 
     private func applyRMEState(_ state: UCXIIState?) {
         guard let state else { return }
+        guard viewState.rmeState != state || !viewState.rmeConnected || viewState.rmeError != nil else { return }
         let wasConnected = viewState.rmeConnected
         let previousState = viewState.rmeState
         if !state.micLine1Muted {
@@ -632,10 +640,9 @@ public final class RemoteCoordinator {
     private func synchronizeRatchetPresentation(displayRefresh: DisplayRefresh) {
         guard ratchetReady else { return }
         do {
-            try send(.ledFrame(presentation.ledFrame(
-                viewState: viewState,
-                brightness: presentationBrightness
-            )))
+            // A full redraw follows configuration/reconnect and must reach the
+            // device even if its pixels match the previous connection.
+            try sendLEDsIfChanged(force: displayRefresh == .full)
             if displayRefresh != .none {
                 try send(.displayFrame(presentation.displayFrame(
                     viewState: viewState,
@@ -668,16 +675,23 @@ public final class RemoteCoordinator {
     private func synchronizeBrightness() {
         guard ratchetReady else { return }
         do {
-            try send(.ledFrame(presentation.ledFrame(
-                viewState: viewState,
-                brightness: presentationBrightness
-            )))
+            try sendLEDsIfChanged()
             try send(.displayFrame(presentation.displayBrightnessFrame(
                 brightness: presentationBrightness
             )))
         } catch {
             report(error)
         }
+    }
+
+    private func sendLEDsIfChanged(force: Bool = false) throws {
+        let frame = presentation.ledFrame(viewState: viewState, brightness: presentationBrightness)
+        // Several adjacent dB values map to the same ring pixels. Frame IDs
+        // change on every build, but identical visible content needs no USB I/O.
+        guard force || frame.rgb888 != lastLEDFrame?.rgb888
+                || frame.brightness != lastLEDFrame?.brightness else { return }
+        try send(.ledFrame(frame))
+        lastLEDFrame = frame
     }
 
     private func send(_ command: Ratchet_V1_HostToDevice.OneOf_Command) throws {
@@ -713,9 +727,11 @@ public final class RemoteCoordinator {
         diagnostic("Error: \(error.localizedDescription)")
     }
 
-    private func diagnostic(_ message: String) {
-        if diagnosticLogging { Self.timingLog.notice("\(message, privacy: .public)") }
-        if diagnosticLogging { print(message) }
+    private func diagnostic(_ message: @autoclosure () -> String) {
+        guard diagnosticLogging else { return }
+        let message = message()
+        Self.timingLog.notice("\(message, privacy: .public)")
+        print(message)
     }
 
     private func format(_ output: StereoOutputState) -> String {
