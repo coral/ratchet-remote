@@ -90,6 +90,7 @@ public enum RMEControlError: Error, LocalizedError, Sendable {
     case unsupportedDeviceMode(Int16)
     case dspQueueNotDrained
     case notConnected
+    case totalMixActive
 
     public var errorDescription: String? {
         switch self {
@@ -103,6 +104,7 @@ public enum RMEControlError: Error, LocalizedError, Sendable {
         case .invalidReadSize(let size): "the RME driver returned an invalid DSP payload size: \(size)"
         case .snapshotTimedOut(let registers):
             "timed out reading UCX II state; missing " + registers.map { String(format: "0x%04x", $0) }.joined(separator: ", ")
+        case .totalMixActive: "RME control is paused while TotalMix is running"
         case .notConnected: "the Fireface UCX II is not connected"
         case .invalidMainAssignment(let pair): "Main Out has no supported output-pair assignment (\(pair))"
         case .unsafeDSPWrite(let register):

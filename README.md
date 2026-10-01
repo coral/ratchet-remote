@@ -202,9 +202,20 @@ mute state. It does not restore those changes automatically.
 ## State behavior
 
 The app uses one serialized RME user client and treats live device state as
-authoritative, including changes made in TotalMix FX. If a stereo pair is
+authoritative. If a stereo pair is
 unlinked, the quieter channel is displayed for safety; the next write through
 Ratchet Remote sets both channels to the same value.
+
+TotalMix FX and Ratchet Remote must not run simultaneous DSP exchanges. Ratchet
+watches for TotalMix's process launch and pauses all RME traffic, including read
+triggers, refresh requests, response ACKs, and queued gain/volume commands. Its
+status becomes **Controlled by TotalMix** and the hardware shows `TOTALMIX OPEN`.
+Quit TotalMix (closing its window is insufficient) to resume Ratchet controls.
+After a two-second settling interval, Ratchet opens a fresh driver session and
+reads the current state. It never replays pending controls or mixer routing.
+Startup and device recovery use the same interval to allow TotalMix's automatic
+launch to settle. This is a process-lifetime handoff, not a driver-level lock;
+an I/O call already in progress when macOS announces the launch can finish.
 
 Discovery matches RME vendor `2a39` and UCX II product `3f82`, then checks the
 opened connection's serial/product via DriverKit's device-identity method.

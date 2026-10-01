@@ -188,6 +188,7 @@ private func selectUCXII(serial wantedSerial: UInt64?) throws -> RMEDevice {
 /// Owns the single serialized RME DriverKit user client used by the app.
 /// No two DSP reads or writes can overlap because all access is actor-isolated.
 public actor UCXIIController {
+    public nonisolated let access = RMEAccessGate()
     private var connection: (any UCXIIDSPTransport)?
     private var serial: UInt64?
     private var pollSequence: UInt8 = 0
@@ -208,7 +209,7 @@ public actor UCXIIController {
 
     // Inject the same DSP boundary used by DriverKit for hardware-free tests.
     init(connection: any UCXIIDSPTransport, serial: UInt64) {
-        self.connection = connection
+        self.connection = GatedDSPTransport(connection, access: access, session: access.session())
         self.serial = serial
     }
 
@@ -217,6 +218,8 @@ public actor UCXIIController {
     @discardableResult
     public func connect(serial wantedSerial: UInt64? = nil) async throws -> UCXIIState {
         disconnect()
+        let accessSession = access.session()
+        try access.validate(accessSession)
         let device = try selectUCXII(serial: wantedSerial)
         defer { device.release() }
         var port: io_connect_t = 0
@@ -224,7 +227,9 @@ public actor UCXIIController {
             IOServiceOpen(device.service, mach_task_self_, 0, &port),
             operation: "opening the RME driver user client"
         )
-        connection = TimedDSPTransport(RMEConnection(port: port))
+        connection = GatedDSPTransport(
+            TimedDSPTransport(RMEConnection(port: port)), access: access, session: accessSession
+        )
         serial = device.serial
         pollSequence = 0
         readArmed = false
@@ -240,6 +245,7 @@ public actor UCXIIController {
     }
 
     public func disconnect() {
+        access.invalidate()
         generation &+= 1
         refreshBusy = false
         nextArm = 0
@@ -283,8 +289,10 @@ public actor UCXIIController {
     }
 
     public func refreshState(timeout: TimeInterval = 2.0, drainFirst: Bool = true) async throws -> UCXIIState {
+        let session = generation
         let pendingAtStart = pendingControls
         let refreshed = try await refreshRegisters(timeout: timeout, drainFirst: drainFirst)
+        guard generation == session else { throw RMEControlError.notConnected }
         guard let serial, refreshed.state(serial: serial) != nil else {
             throw RMEControlError.snapshotTimedOut(missingRegisters: refreshed.missingRegisters)
         }
@@ -340,6 +348,7 @@ public actor UCXIIController {
                 requests += 1
             }
             guard let words = try await waitForRead(connection, deadline: min(deadline, nextRequest)) else { continue }
+            guard generation == session else { throw RMEControlError.notConnected }
             frames += 1
             // As in the Rust session, extend only when new register addresses
             // arrive. Repeated unsolicited updates must not suppress retries.

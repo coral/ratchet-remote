@@ -293,7 +293,7 @@ public struct RatchetPresentationBuilder: Sendable {
                 color: RemotePalette.red
             ))
             operations.append(Self.text(
-                "DISCONNECTED",
+                viewState.totalMixRunning ? "TOTALMIX OPEN" : "DISCONNECTED",
                 y: 128,
                 size: .medium,
                 scale: 1,

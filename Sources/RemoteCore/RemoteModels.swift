@@ -58,6 +58,7 @@ public struct RemoteViewState: Equatable, Sendable {
     public var ratchetConnected: Bool
     public var ratchetConfigured: Bool
     public var ratchetSerial: String?
+    public var totalMixRunning: Bool
     public var rmeConnected: Bool
     public var rmeState: UCXIIState?
     public var mutedRestoreVolumes: [RMEOutput: Int16]
@@ -69,6 +70,7 @@ public struct RemoteViewState: Equatable, Sendable {
         ratchetConnected = false
         ratchetConfigured = false
         ratchetSerial = nil
+        totalMixRunning = false
         rmeConnected = false
         rmeState = nil
         mutedRestoreVolumes = [:]
@@ -93,7 +95,8 @@ public struct RemoteViewState: Equatable, Sendable {
     }
 
     public var statusSummary: String {
-        switch (ratchetConnected, ratchetConfigured, rmeConnected) {
+        if totalMixRunning { return "Controlled by TotalMix" }
+        return switch (ratchetConnected, ratchetConfigured, rmeConnected) {
         case (true, true, true): "Connected"
         case (true, false, _): "Configuring Ratchet"
         case (false, _, true): "Ratchet offline"

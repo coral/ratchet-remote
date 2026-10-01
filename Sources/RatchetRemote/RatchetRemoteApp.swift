@@ -223,7 +223,8 @@ private struct RemoteMenuView: View {
                 .contentTransition(.numericText())
                 .foregroundStyle(coordinator.viewState.selectedOutputMuted ? muteRed : .white)
                 .minimumScaleFactor(0.7)
-            Text(coordinator.viewState.rmeConnected ? coordinator.viewState.selectedRole.label : "RME OFFLINE")
+            Text(coordinator.viewState.rmeConnected ? coordinator.viewState.selectedRole.label
+                 : coordinator.viewState.totalMixRunning ? "TOTALMIX OPEN" : "RME OFFLINE")
                 .font(.system(size: 12, weight: .bold, design: .monospaced))
                 .tracking(2)
                 .foregroundStyle(coordinator.viewState.rmeConnected ? Color.yellow : muteRed)

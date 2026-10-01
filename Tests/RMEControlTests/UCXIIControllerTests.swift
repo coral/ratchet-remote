@@ -24,6 +24,9 @@ private final class MixerTransport: UCXIIDSPTransport, @unchecked Sendable {
     var identity = UCXIIDeviceIdentity(serial: 123, product: 0x3f82)
     var identityReads = 0
     var responseDelay: TimeInterval = 0
+    var reads = 0
+    var triggers = 0
+    var afterFrameRead: (() -> Void)?
     private var responseReadyAt: TimeInterval = 0
 
     func identify() -> UCXIIDeviceIdentity {
@@ -51,10 +54,14 @@ private final class MixerTransport: UCXIIDSPTransport, @unchecked Sendable {
         }
     }
 
-    func triggerDSPRead() {}
+    func triggerDSPRead() { triggers += 1 }
     func readDSP() -> [UInt32] {
+        reads += 1
         guard ProcessInfo.processInfo.systemUptime >= responseReadyAt else { return [] }
-        return frames.isEmpty ? [] : frames.removeFirst()
+        guard !frames.isEmpty else { return [] }
+        let frame = frames.removeFirst()
+        afterFrameRead?()
+        return frame
     }
 
     var controlWrites: [UInt32] {
@@ -306,4 +313,101 @@ func writeBoundaryRejectsInputMuteOtherGainsRoutingAndAssignments(register: UInt
     let validChanged = accumulator.update(words: [valid])
     #expect(validChanged)
     #expect(accumulator.values[0x0008] == 590)
+}
+
+@Test func totalMixBlocksAllDriverTrafficIncludingAlreadyQueuedControls() async throws {
+    let mixer = MixerTransport()
+    let controller = UCXIIController(connection: mixer, serial: 123)
+    _ = try await controller.refreshState()
+    let writes = mixer.writes
+    let reads = mixer.reads
+    let triggers = mixer.triggers
+    controller.access.setTotalMixRunning(true)
+
+    await #expect(throws: RMEControlError.self) { try await controller.poll() }
+    await #expect(throws: RMEControlError.self) { try await controller.refreshState() }
+    await #expect(throws: RMEControlError.self) { try await controller.setMicLine1Gain(dbTenths: 0) }
+    await #expect(throws: RMEControlError.self) { try await controller.setVolume(dbTenths: -650, output: .main) }
+    await #expect(throws: RMEControlError.self) { try await controller.setVolume(dbTenths: -650, output: .phones) }
+    #expect(mixer.writes == writes)
+    #expect(mixer.reads == reads)
+    #expect(mixer.triggers == triggers)
+}
+
+@Test func totalMixLaunchBetweenReadAndAckDoesNotAcknowledgeItsFrame() async throws {
+    let mixer = MixerTransport()
+    let controller = UCXIIController(connection: mixer, serial: 123)
+    _ = try await controller.refreshState()
+    mixer.frames = [[RMEWordCodec.encodeWrite(register: 0x0500, value: -100)]]
+    let writes = mixer.writes
+    mixer.afterFrameRead = { controller.access.setTotalMixRunning(true) }
+    do {
+        _ = try await controller.poll()
+        Issue.record("Launch must prevent the ACK and adoption of the frame")
+    } catch RMEControlError.totalMixActive {}
+    #expect(mixer.writes == writes)
+    #expect(await controller.currentState()?.main.leftDBTenths == -200)
+}
+
+@Test func briefTotalMixLaunchRevokesSnapshotEvenIfItQuitsBeforeTheNextRead() async throws {
+    let mixer = MixerTransport()
+    let controller = UCXIIController(connection: mixer, serial: 123)
+    _ = try await controller.refreshState()
+    mixer.responseDelay = 1
+    let refresh = Task { try await controller.refreshState() }
+    try await Task.sleep(for: .milliseconds(30))
+    controller.access.setTotalMixRunning(true)
+    controller.access.setTotalMixRunning(false)
+    do {
+        _ = try await refresh.value
+        Issue.record("Resuming must not revive the previous driver session")
+    } catch RMEControlError.notConnected {}
+    let writes = mixer.writes
+    let reads = mixer.reads
+    await #expect(throws: RMEControlError.self) { try await controller.setMicLine1Gain(dbTenths: 0) }
+    await #expect(throws: RMEControlError.self) { try await controller.refreshState() }
+    #expect(mixer.writes == writes)
+    #expect(mixer.reads == reads)
+    await controller.disconnect()
+    #expect(await controller.currentState() == nil)
+}
+
+@Test func pausedStartupDoesNotIdentifyOrReadTheDevice() async throws {
+    let mixer = MixerTransport()
+    let controller = UCXIIController(connection: mixer, serial: 123)
+    controller.access.setTotalMixRunning(true)
+    await #expect(throws: RMEControlError.self) { try await controller.refreshState() }
+    #expect(mixer.identityReads == 0)
+    #expect(mixer.reads == 0)
+    #expect(mixer.triggers == 0)
+    #expect(mixer.writes.isEmpty)
+    // A public connect is also vetoed before discovery/IOServiceOpen.
+    do {
+        _ = try await controller.connect()
+        Issue.record("Connect must be vetoed before device discovery")
+    } catch RMEControlError.totalMixActive {}
+}
+
+@Test func resumingDriverAccessRequiresANewTransportSession() throws {
+    let mixer = MixerTransport()
+    let access = RMEAccessGate()
+    let old = GatedDSPTransport(mixer, access: access, session: access.session())
+    _ = try old.identify()
+    access.setTotalMixRunning(true)
+    access.setTotalMixRunning(false)
+    #expect(throws: RMEControlError.self) { try old.readDSP() }
+    #expect(throws: RMEControlError.self) { try old.triggerDSPRead() }
+    #expect(throws: RMEControlError.self) {
+        try old.writeDSP([RMEWordCodec.encodeWrite(register: 0x0008, value: 0)])
+    }
+    #expect(mixer.reads == 0)
+    #expect(mixer.triggers == 0)
+    #expect(mixer.writes.isEmpty)
+
+    let fresh = GatedDSPTransport(mixer, access: access, session: access.session())
+    try fresh.triggerDSPRead()
+    _ = try fresh.readDSP()
+    #expect(mixer.triggers == 1)
+    #expect(mixer.reads == 1)
+    #expect(mixer.writes.isEmpty)
 }

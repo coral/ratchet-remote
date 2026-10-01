@@ -35,6 +35,9 @@ public final class RemoteCoordinator {
 
     @ObservationIgnored private let transport: RatchetHIDTransport
     @ObservationIgnored private let rme: UCXIIController
+    @ObservationIgnored private let totalMixMonitor = TotalMixMonitor()
+    @ObservationIgnored private var rmeGeneration: UInt64 = 0
+    @ObservationIgnored private var rmeReadyAfter: TimeInterval = 0
     @ObservationIgnored private let diagnosticLogging: Bool
     @ObservationIgnored private var session: RatchetSession?
     @ObservationIgnored private var presentation = RatchetPresentationBuilder()
@@ -105,6 +108,10 @@ public final class RemoteCoordinator {
     public func start() {
         guard !started else { return }
         started = true
+        rmeReadyAfter = now + 2.0
+        totalMixMonitor.start { [weak self] running in
+            self?.totalMixChanged(running: running)
+        }
         lastInteractionAt = now
         presentationBrightness = ActivityBrightness.active
         startRatchetTransport()
@@ -132,8 +139,12 @@ public final class RemoteCoordinator {
         recordInteraction()
         ratchetReconnectTask?.cancel()
         ratchetReconnectTask = nil
-        await rme.disconnect()
+        rmeGeneration &+= 1
+        let generation = rmeGeneration
+        rmeReadyAfter = now + 2.0
         markRMEOffline(error: nil)
+        await rme.disconnect()
+        guard generation == rmeGeneration, started else { return }
         transport.stop()
         session = nil
         ratchetReady = false
@@ -162,6 +173,7 @@ public final class RemoteCoordinator {
 
     public func toggleMicLine1Mute() async {
         recordInteraction()
+        let generation = rmeGeneration
         guard !micMuteTransition, let state = viewState.rmeState else { return }
         micMuteTransition = true
         defer { micMuteTransition = false }
@@ -179,16 +191,19 @@ public final class RemoteCoordinator {
         }
 
         do {
-            applyRMEState(try await rme.setMicLine1Gain(dbTenths: target))
+            let state = try await rme.setMicLine1Gain(dbTenths: target)
+            guard acceptsRMEState(generation) else { return }
+            applyRMEState(state)
             lastControlSubmission = now
             controlReadbackDue = true
         } catch {
-            await handleRMEOperationFailure(error)
+            await handleRMEOperationFailure(error, generation: generation)
         }
     }
 
     public func toggleMute(_ output: RMEOutput) async {
         recordInteraction()
+        let generation = rmeGeneration
         guard viewState.rmeState != nil,
               outputMuteTransitions.insert(output).inserted else { return }
         defer { outputMuteTransitions.remove(output) }
@@ -201,7 +216,7 @@ public final class RemoteCoordinator {
             } catch { return }
         }
 
-        guard let current = viewState.rmeState?[output] else { return }
+        guard acceptsRMEState(generation), let current = viewState.rmeState?[output] else { return }
         let target: Int16
         if current.isAtFloor {
             target = restoreVolumes[output]
@@ -214,12 +229,14 @@ public final class RemoteCoordinator {
         }
 
         do {
-            applyRMEState(try await rme.setVolume(dbTenths: target, output: output))
+            let state = try await rme.setVolume(dbTenths: target, output: output)
+            guard acceptsRMEState(generation) else { return }
+            applyRMEState(state)
             lastControlSubmission = now
             controlReadbackDue = true
             mappers[role]?.resetBaseline()
         } catch {
-            await handleRMEOperationFailure(error)
+            await handleRMEOperationFailure(error, generation: generation)
             return
         }
 
@@ -250,6 +267,8 @@ public final class RemoteCoordinator {
             }
         }
         started = false
+        totalMixMonitor.stop()
+        rmeGeneration &+= 1
         ratchetReconnectTask?.cancel()
         transportTask?.cancel()
         sessionTask?.cancel()
@@ -422,13 +441,16 @@ public final class RemoteCoordinator {
         guard volumeWriterTask == nil else { return }
         volumeWriterTask = Task { [weak self] in
             guard let self else { return }
-            while !Task.isCancelled, let request = self.volumeWrites.beginNext() {
+            let generation = self.rmeGeneration
+            while !Task.isCancelled, self.acceptsRMEState(generation),
+                  let request = self.volumeWrites.beginNext() {
                 do {
                     let started = self.now
                     let state = try await self.rme.setVolume(
                         dbTenths: request.value,
                         output: request.role.rmeOutput
                     )
+                    guard self.acceptsRMEState(generation), !Task.isCancelled else { break }
                     self.lastControlSubmission = self.now
                     self.controlReadbackDue = true
                     let elapsed = (self.now - started) * 1_000
@@ -443,8 +465,9 @@ public final class RemoteCoordinator {
                         try? await Task.sleep(for: .milliseconds(20))
                     }
                 } catch {
+                    guard self.acceptsRMEState(generation) else { break }
                     self.volumeWrites.finish(request.role)
-                    await self.handleRMEOperationFailure(error)
+                    await self.handleRMEOperationFailure(error, generation: generation)
                     break
                 }
             }
@@ -494,52 +517,79 @@ public final class RemoteCoordinator {
         }
     }
 
+    private func totalMixChanged(running: Bool) {
+        // Revoke the transport before scheduling any asynchronous cleanup.
+        rme.access.setTotalMixRunning(running)
+        guard viewState.totalMixRunning != running else { return }
+        rmeGeneration &+= 1
+        viewState.totalMixRunning = running
+        rmeReadyAfter = now + 2.0
+        controlReadbackDue = false
+        viewState.rmeError = nil
+        markRMEOffline(error: nil)
+        synchronizeRatchetPresentation(displayRefresh: .full)
+        Self.connectionLog.notice("RME ownership: TotalMix running=\(running); \(running ? "pausing driver access" : "waiting to read fresh state", privacy: .public)")
+    }
+
+    private func acceptsRMEState(_ generation: UInt64) -> Bool {
+        started && !viewState.totalMixRunning && generation == rmeGeneration
+    }
+
     private func runRMEConnection() async {
         var nextRefresh = 0.0
         while !Task.isCancelled {
+            let generation = rmeGeneration
             do {
+                if viewState.totalMixRunning {
+                    if await rme.isConnected { await rme.disconnect() }
+                    try await Task.sleep(for: .milliseconds(100))
+                    continue
+                }
                 if !viewState.rmeConnected {
+                    // Device restarts can auto-launch TotalMix. Allow that launch
+                    // to settle before opening another DSP client.
+                    if now < rmeReadyAfter {
+                        try await Task.sleep(for: .milliseconds(100))
+                        continue
+                    }
                     let state = try await rme.connect(serial: rmeSerial)
+                    guard acceptsRMEState(generation), !Task.isCancelled else { continue }
                     rmeSerial = state.serial
                     applyRMEState(state)
                     nextRefresh = now + 2.0
-                    if ratchetReady {
-                        try sendHaptics()
-                    }
+                    if ratchetReady { try sendHaptics() }
                 } else if (controlReadbackDue || now >= nextRefresh),
                           volumeWrites.isEmpty, now - lastControlSubmission >= 0.150 {
                     controlReadbackDue = false
                     let state = try await rme.refreshState(timeout: 2.0)
+                    guard acceptsRMEState(generation), !Task.isCancelled else { continue }
                     applyRMEState(state)
                     nextRefresh = now + 2.0
-                } else if let state = try await rme.poll() {
+                } else {
+                    let state = try await rme.poll()
+                    guard acceptsRMEState(generation), !Task.isCancelled else { continue }
                     applyRMEState(state)
                 }
-                // poll() only consumes completed frames; let USB finish without
-                // occupying the RME actor or spinning on the main actor.
                 try await Task.sleep(for: .milliseconds(5))
             } catch is CancellationError {
                 return
             } catch {
+                guard !Task.isCancelled else { return }
+                guard acceptsRMEState(generation) else { continue }
                 if case RMEControlError.snapshotTimedOut = error, viewState.rmeConnected {
-                    // A partial periodic dump is not a USB disconnect. Keep
-                    // servicing live updates and retry without resetting HID,
-                    // haptics, mapper baselines, or the user's pending targets.
                     Self.timingLog.warning("background.snapshot-incomplete: \(error.localizedDescription, privacy: .public); retaining state and retrying")
                     nextRefresh = now + 0.5
                     controlReadbackDue = false
                     continue
                 }
                 Self.connectionLog.error("RME recovery: \(error.localizedDescription, privacy: .public)")
-                await rme.disconnect()
-                markRMEOffline(error: error)
-                try? await Task.sleep(for: .seconds(1))
+                await handleRMEOperationFailure(error, generation: generation)
             }
         }
     }
 
     private func applyRMEState(_ state: UCXIIState?) {
-        guard let state else { return }
+        guard started, !viewState.totalMixRunning, let state else { return }
         guard viewState.rmeState != state || !viewState.rmeConnected || viewState.rmeError != nil else { return }
         let wasConnected = viewState.rmeConnected
         let previousState = viewState.rmeState
@@ -615,9 +665,13 @@ public final class RemoteCoordinator {
         }
     }
 
-    private func handleRMEOperationFailure(_ error: Error) async {
-        await rme.disconnect()
+    private func handleRMEOperationFailure(_ error: Error, generation: UInt64) async {
+        guard acceptsRMEState(generation) else { return }
+        rmeGeneration &+= 1
+        rmeReadyAfter = now + 2.0
+        controlReadbackDue = false
         markRMEOffline(error: error)
+        await rme.disconnect()
     }
 
     private func reconcileVolumeMappers() {
